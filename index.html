@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="color-scheme" content="dark only">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="PC Monitor">
+  <link rel="apple-touch-icon" href="/icon.png">
+  <link rel="manifest" href="/manifest.json">
+  <title>PC Hardware Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark only;
+      --bg: #07080a;
+      --card-bg: #0f1117;
+      --card-border: #1e222d;
+      --text-main: #f0f3f8;
+      --text-muted: #7d8590;
+      --cpu-color: #00e676;
+      --ram-color: #3d84ff;
+      --gpu-color: #bd53ed;
+      --net-color: #00e5ff;
+      --danger-color: #ff3366;
+      --warning-color: #ffab00;
+      --font-mono: 'SF Mono', 'Segoe UI Mono', 'Consolas', 'Roboto Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 10px;
+    }
+
+    /* Top offline / reconnection notification banner */
+    #status-banner {
+      display: none;
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 51, 102, 0.9);
+      color: #fff;
+      padding: 6px 18px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      box-shadow: 0 4px 15px rgba(255, 51, 102, 0.4);
+      z-index: 1000;
+      animation: pulse 1.5s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
+    }
+
+    /* Header bar with controls */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 12px;
+      margin-bottom: 8px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand-icon {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--cpu-color);
+      box-shadow: 0 0 10px var(--cpu-color);
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+
+    .brand-title {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: #fff;
+    }
+
+    .brand-host {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn-action {
+      background: #171b24;
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: background 0.2s;
+    }
+
+    .btn-action:hover {
+      background: #252b3a;
+    }
+
+    /* Main Dashboard Grid */
+    .dashboard-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex: 1;
+    }
+
+    /* Top Row: Clock, CPU, RAM, GPU */
+    .row-top {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+      min-height: 155px;
+    }
+
+    .card-tag {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 95%;
+    }
+
+    /* Clock Card */
+    .clock-card {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      gap: 3px;
+    }
+
+    .clock-time {
+      font-family: var(--font-mono);
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      color: #ffffff;
+      line-height: 1.1;
+      margin-bottom: 3px;
+      white-space: nowrap;
+    }
+
+    .clock-seconds {
+      color: var(--ram-color);
+      font-size: 0.8em;
+      margin-left: 2px;
+      font-weight: 600;
+    }
+
+    .clock-date {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 3px;
+    }
+
+    .system-uptime {
+      font-size: 10px;
+      font-family: var(--font-mono);
+      color: #8c95a5;
+      background: rgba(255, 255, 255, 0.05);
+      padding: 2px 8px;
+      border-radius: 10px;
+      margin-top: 2px;
+    }
+
+    /* Gauges */
+    .gauge-container {
+      position: relative;
+      width: 105px;
+      height: 105px;
+      margin-bottom: 4px;
+    }
+
+    .gauge-svg {
+      transform: rotate(-90deg);
+      width: 100%;
+      height: 100%;
+    }
+
+    .gauge-bg {
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.08);
+      stroke-width: 8;
+    }
+
+    .gauge-progress {
+      fill: none;
+      stroke-width: 8;
+      stroke-linecap: round;
+      stroke-dasharray: 251.2;
+      stroke-dashoffset: 251.2;
+      transition: stroke-dashoffset 0.6s cubic-bezier(0.4, 0, 0.2, 1), stroke 0.3s;
+    }
+
+    .gauge-center-text {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .gauge-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+
+    .gauge-value {
+      font-size: 26px;
+      font-weight: 800;
+      font-family: var(--font-mono);
+      color: #fff;
+      line-height: 1.1;
+    }
+
+    .gauge-value small {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .card-subtext {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 100%;
+    }
+
+    /* Bottom Row: 3 Panels (Processes, Displays/Apps, Network & Disks) */
+    .row-bottom {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 10px;
+    }
+
+    .panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      min-height: 170px;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .panel-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Processes List */
+    .proc-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      overflow: hidden;
+    }
+
+    .proc-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      padding: 4px 6px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 6px;
+    }
+
+    .proc-name {
+      font-weight: 600;
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #e1e4ea;
+    }
+
+    .proc-cpu {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--cpu-color);
+    }
+
+    /* Monitors / Active App */
+    .monitor-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      padding: 8px;
+      margin-bottom: 6px;
+    }
+
+    .monitor-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+
+    .monitor-name {
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .monitor-hz {
+      background: #1e2838;
+      color: #4da3ff;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+    }
+
+    .monitor-app {
+      font-size: 11px;
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .monitor-app-active {
+      color: var(--cpu-color);
+      font-weight: 600;
+    }
+
+    /* Network & Storage */
+    .net-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .net-box {
+      background: rgba(255, 255, 255, 0.03);
+      padding: 6px 8px;
+      border-radius: 8px;
+    }
+
+    .net-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .net-val {
+      font-size: 14px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      color: var(--net-color);
+    }
+
+    .disk-bar-container {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .disk-item {
+      font-size: 11px;
+    }
+
+    .disk-label {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 2px;
+      color: var(--text-muted);
+    }
+
+    .disk-progress-bg {
+      height: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .disk-progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #3d84ff, #bd53ed);
+      border-radius: 3px;
+      transition: width 0.4s;
+    }
+
+    /* Responsive for mobile portrait orientation */
+    @media (max-width: 768px) {
+      .row-top {
+        grid-template-columns: 1fr 1fr;
+      }
+      .clock-time {
+        font-size: 22px;
+      }
+      .card-tag {
+        font-size: 10px;
+      }
+      .row-bottom {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Floating Offline Notification -->
+  <div id="status-banner">⚠️ MONITORING TERPUTUS · PC OFFLINE</div>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon" id="pulse-indicator"></div>
+      <div>
+        <div class="brand-title">PC Monitor HUD</div>
+        <div class="brand-host" id="host-info">Menghubungkan ke PC...</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="btn-action" id="btn-fullscreen" onclick="toggleFullScreen()">
+        ⛶ Layar Penuh
+      </button>
+      <button class="btn-action" id="btn-wakelock" onclick="requestWakeLock()">
+        ⚡ Keep On
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Grid -->
+  <div class="dashboard-grid">
+    <!-- Top Row: Clock, CPU, RAM, GPU -->
+    <div class="row-top">
+      
+      <!-- Clock Card -->
+      <div class="card clock-card">
+        <div class="card-tag">WAKTU SISTEM</div>
+        <div class="clock-time" id="clock-display">
+          --:--<span class="clock-seconds">:--</span>
+        </div>
+        <div class="clock-date" id="date-display">MEMUAT WAKTU...</div>
+        <div class="system-uptime" id="uptime-display">Uptime: --</div>
+      </div>
+
+      <!-- CPU Card -->
+      <div class="card">
+        <div class="card-tag" id="cpu-name" title="Mendeteksi CPU...">MEMUAT CPU...</div>
+        <div class="gauge-container">
+          <svg class="gauge-svg" viewBox="0 0 100 100">
+            <circle class="gauge-bg" cx="50" cy="50" r="40" />
+            <circle class="gauge-progress" id="cpu-ring" cx="50" cy="50" r="40" stroke="var(--cpu-color)" />
+          </svg>
+          <div class="gauge-center-text">
+            <div class="gauge-label">CPU</div>
+            <div class="gauge-value" id="cpu-val">0<small>%</small></div>
+          </div>
+        </div>
+        <div class="card-subtext" id="cpu-sub">-- GHz</div>
+      </div>
+
+      <!-- RAM Card -->
+      <div class="card">
+        <div class="card-tag" id="ram-name">MEMORI RAM</div>
+        <div class="gauge-container">
+          <svg class="gauge-svg" viewBox="0 0 100 100">
+            <circle class="gauge-bg" cx="50" cy="50" r="40" />
+            <circle class="gauge-progress" id="ram-ring" cx="50" cy="50" r="40" stroke="var(--ram-color)" />
+          </svg>
+          <div class="gauge-center-text">
+            <div class="gauge-label">RAM</div>
+            <div class="gauge-value" id="ram-val">0<small>%</small></div>
+          </div>
+        </div>
+        <div class="card-subtext" id="ram-sub">-- / -- GB</div>
+      </div>
+
+      <!-- GPU Card -->
+      <div class="card">
+        <div class="card-tag" id="gpu-name" title="Mendeteksi GPU...">MEMUAT GPU...</div>
+        <div class="gauge-container">
+          <svg class="gauge-svg" viewBox="0 0 100 100">
+            <circle class="gauge-bg" cx="50" cy="50" r="40" />
+            <circle class="gauge-progress" id="gpu-ring" cx="50" cy="50" r="40" stroke="var(--gpu-color)" />
+          </svg>
+          <div class="gauge-center-text">
+            <div class="gauge-label">GPU</div>
+            <div class="gauge-value" id="gpu-val">0<small>%</small></div>
+          </div>
+        </div>
+        <div class="card-subtext" id="gpu-sub">-- · --°C</div>
+      </div>
+
+    </div>
+
+    <!-- Bottom Row: Top Processes, Displays & Active App, Network & Storage -->
+    <div class="row-bottom">
+      
+      <!-- Top Processes -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">⚡ Top Proses CPU</div>
+        </div>
+        <div class="proc-list" id="proc-list">
+          <div class="proc-item"><span>Memuat proses...</span><span>--</span></div>
+        </div>
+      </div>
+
+      <!-- Displays & Foreground App -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">🖥️ Monitor & Aplikasi Aktif</div>
+        </div>
+        <div id="monitors-list">
+          <div class="monitor-card">
+            <div class="monitor-top">
+              <span class="monitor-name">Mendeteksi monitor...</span>
+              <span class="monitor-hz">-- Hz</span>
+            </div>
+            <div class="monitor-app">Top: --</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Network & Storage -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">🌐 Jaringan & Storage</div>
+        </div>
+        <div class="net-stats">
+          <div class="net-box">
+            <div class="net-label">▼ Download</div>
+            <div class="net-val" id="net-down">0 KB/s</div>
+          </div>
+          <div class="net-box">
+            <div class="net-label">▲ Upload</div>
+            <div class="net-val" id="net-up">0 KB/s</div>
+          </div>
+        </div>
+        <div class="disk-bar-container" id="disks-list">
+          <!-- Disks injected dynamically -->
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const CIRCUMFERENCE = 251.2; // 2 * PI * 40
+    let failureCount = 0;
+    let wakeLock = null;
+
+    // Local Clock (always ticks even if PC is offline)
+    function updateClock() {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      
+      const hh = pad(now.getHours());
+      const mm = pad(now.getMinutes());
+      const ss = pad(now.getSeconds());
+
+      document.getElementById('clock-display').innerHTML = `${hh}:${mm}<span class="clock-seconds">:${ss}</span>`;
+
+      const days = ['MINGGU', 'SENIN', 'SELASA', 'RABU', 'KAMIS', 'JUMAT', 'SABTU'];
+      const months = ['JAN', 'FEB', 'MAR', 'APR', 'MEI', 'JUN', 'JUL', 'AGU', 'SEP', 'OKT', 'NOV', 'DES'];
+      
+      const dayName = days[now.getDay()];
+      const dayNum = pad(now.getDate());
+      const monName = months[now.getMonth()];
+
+      document.getElementById('date-display').textContent = `${dayName}, ${dayNum} ${monName}`;
+    }
+    setInterval(updateClock, 500);
+    updateClock();
+
+    // Gauge Progress Helper
+    function setGauge(ringId, percent, colorBase) {
+      const ring = document.getElementById(ringId);
+      const clamped = Math.max(0, Math.min(100, percent));
+      const offset = CIRCUMFERENCE - (clamped / 100) * CIRCUMFERENCE;
+      ring.style.strokeDashoffset = offset;
+
+      if (clamped >= 90) {
+        ring.style.stroke = 'var(--danger-color)';
+      } else if (clamped >= 75) {
+        ring.style.stroke = 'var(--warning-color)';
+      } else {
+        ring.style.stroke = colorBase;
+      }
+    }
+
+    // Keep screen awake (WakeLock API for Android)
+    async function requestWakeLock() {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+          const btn = document.getElementById('btn-wakelock');
+          btn.style.background = '#00e676';
+          btn.style.color = '#000';
+          btn.textContent = '⚡ Screen ON';
+          wakeLock.addEventListener('release', () => {
+            btn.style.background = '#171b24';
+            btn.style.color = 'var(--text-main)';
+            btn.textContent = '⚡ Keep On';
+          });
+        }
+      } catch (err) {
+        console.warn('Wake Lock error:', err);
+      }
+    }
+
+    // Re-request wake lock on visibility change (when returning to app)
+    document.addEventListener('visibilitychange', async () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+      }
+    });
+    // Request wake lock initially
+    requestWakeLock();
+
+    // Fullscreen Toggle
+    function toggleFullScreen() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+        document.getElementById('btn-fullscreen').textContent = '✕ Exit Full';
+      } else {
+        if (document.exitFullscreen) {
+          document.exitFullscreen();
+          document.getElementById('btn-fullscreen').textContent = '⛶ Layar Penuh';
+        }
+      }
+    }
+
+    // Fetch Stats from app.py
+    async function fetchStats() {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+      try {
+        const res = await fetch('/api/stats', { signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        
+        // Online state restored
+        failureCount = 0;
+        document.getElementById('status-banner').style.display = 'none';
+        document.getElementById('pulse-indicator').style.background = 'var(--cpu-color)';
+        document.getElementById('pulse-indicator').style.boxShadow = '0 0 10px var(--cpu-color)';
+        
+        renderStats(data);
+      } catch (err) {
+        failureCount++;
+        if (failureCount >= 2) {
+          // Trigger offline UI
+          document.getElementById('status-banner').style.display = 'block';
+          document.getElementById('pulse-indicator').style.background = 'var(--danger-color)';
+          document.getElementById('pulse-indicator').style.boxShadow = '0 0 10px var(--danger-color)';
+          document.getElementById('host-info').textContent = 'Terputus dari PC Server';
+        }
+      }
+    }
+
+    function renderStats(data) {
+      if (data.hostname && data.ip) {
+        document.getElementById('host-info').textContent = `${data.hostname} (${data.ip})`;
+      }
+
+      if (data.uptime) {
+        document.getElementById('uptime-display').textContent = `Uptime: ${data.uptime}`;
+      }
+
+      // CPU
+      const cpuPercent = Math.round(data.cpu || 0);
+      document.getElementById('cpu-val').innerHTML = `${cpuPercent}<small>%</small>`;
+      setGauge('cpu-ring', cpuPercent, 'var(--cpu-color)');
+
+      if (data.cpu_model) {
+        document.getElementById('cpu-name').textContent = data.cpu_model;
+        document.getElementById('cpu-name').title = data.cpu_model;
+      }
+      const cpuFreq = data.cpu_freq ? `${data.cpu_freq} GHz` : '--';
+      const coresInfo = (data.cpu_cores && data.cpu_threads) ? `${data.cpu_cores}C/${data.cpu_threads}T` : '';
+      if (data.cpu_temp) {
+        document.getElementById('cpu-sub').textContent = `${data.cpu_temp}°C · ${cpuFreq}`;
+      } else {
+        document.getElementById('cpu-sub').textContent = coresInfo ? `${cpuFreq} · ${coresInfo}` : cpuFreq;
+      }
+
+      // RAM
+      const ramPercent = Math.round(data.ram_percent || 0);
+      document.getElementById('ram-val').innerHTML = `${ramPercent}<small>%</small>`;
+      setGauge('ram-ring', ramPercent, 'var(--ram-color)');
+      document.getElementById('ram-sub').textContent = `${data.ram_used || 0} / ${data.ram_total || 0} GB`;
+
+      // GPU
+      const gpuPercent = Math.round(data.gpu ? (data.gpu.usage || 0) : 0);
+      document.getElementById('gpu-val').innerHTML = `${gpuPercent}<small>%</small>`;
+      setGauge('gpu-ring', gpuPercent, 'var(--gpu-color)');
+      const gpuName = data.gpu ? (data.gpu.name || 'GPU') : 'GPU';
+      document.getElementById('gpu-name').textContent = gpuName;
+      document.getElementById('gpu-name').title = gpuName;
+
+      const gpuTemp = data.gpu && data.gpu.temp ? `${data.gpu.temp}°C` : 'N/A';
+      const vramInfo = (data.gpu && data.gpu.vram_used !== undefined) ? `VRAM ${data.gpu.vram_used} GB` : '';
+      document.getElementById('gpu-sub').textContent = vramInfo ? `${gpuTemp} · ${vramInfo}` : gpuTemp;
+
+      // Top Processes
+      if (data.processes && data.processes.length > 0) {
+        const procListHtml = data.processes.slice(0, 5).map(p => `
+          <div class="proc-item">
+            <span class="proc-name" title="${p.name}">${p.name}</span>
+            <span class="proc-cpu">${p.cpu.toFixed(1)}%</span>
+          </div>
+        `).join('');
+        document.getElementById('proc-list').innerHTML = procListHtml;
+      }
+
+      // Displays & Monitors
+      if (data.monitors && data.monitors.length > 0) {
+        const monHtml = data.monitors.map(m => `
+          <div class="monitor-card">
+            <div class="monitor-top">
+              <span class="monitor-name">${m.name}</span>
+              <span class="monitor-hz">${m.hz} Hz</span>
+            </div>
+            <div class="monitor-app">Top: <span class="monitor-app-active">${m.app || 'Desktop'}</span></div>
+          </div>
+        `).join('');
+        document.getElementById('monitors-list').innerHTML = monHtml;
+      }
+
+      // Network
+      if (data.network) {
+        document.getElementById('net-down').textContent = data.network.down || '0 KB/s';
+        document.getElementById('net-up').textContent = data.network.up || '0 KB/s';
+      }
+
+      // Disks
+      if (data.disks && data.disks.length > 0) {
+        const disksHtml = data.disks.map(d => `
+          <div class="disk-item">
+            <div class="disk-label">
+              <span>Drive ${d.device}</span>
+              <span>${d.used_gb} / ${d.total_gb} GB (${d.percent}%)</span>
+            </div>
+            <div class="disk-progress-bg">
+              <div class="disk-progress-bar" style="width: ${d.percent}%"></div>
+            </div>
+          </div>
+        `).join('');
+        document.getElementById('disks-list').innerHTML = disksHtml;
+      }
+    }
+
+    // Polling interval 1 second
+    setInterval(fetchStats, 1000);
+    fetchStats();
+
+    // Register Service Worker for PWA
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
