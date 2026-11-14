@@ -57,7 +57,7 @@ Program ini dibangun dengan arsitektur **Cross-Platform Dual-Engine** yang secar
 ### 2. Menjalankan di Linux
 1. Masuk ke direktori repositori:
    ```bash
-   cd "PC HW Monitor V250"
+   cd "PC HW Monitor V2.5"
    ```
 2. Jalankan skrip monitor:
    ```bash
@@ -111,13 +111,6 @@ Terminal akan menampilkan tautan IP lokal, contoh:
 ```bash
 # Menjalankan server secara manual
 python3 app.py
-
-# Mengubah refresh rate monitor ke 180Hz (Linux & Windows)
-python3 app.py --set-hz 180
-
-# Mengubah refresh rate ke 180Hz lalu langsung menjalankan server
-python3 app.py --set-hz 180 --run
-```
 
 ---
 
