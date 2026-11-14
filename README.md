@@ -112,13 +112,6 @@ Terminal akan menampilkan tautan IP lokal, contoh:
 # Menjalankan server secara manual
 python3 app.py
 
-# Mengubah refresh rate monitor ke 180Hz (Linux & Windows)
-python3 app.py --set-hz 180
-
-# Mengubah refresh rate ke 180Hz lalu langsung menjalankan server
-python3 app.py --set-hz 180 --run
-```
-
 ---
 
 ## 🔧 Penanganan Kendala (Troubleshooting)
