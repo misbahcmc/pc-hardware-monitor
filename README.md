@@ -57,7 +57,7 @@ Program ini dibangun dengan arsitektur **Cross-Platform Dual-Engine** yang secar
 ### 2. Menjalankan di Linux
 1. Masuk ke direktori repositori:
    ```bash
-   cd "PC HW Monitor v2.5"
+   cd "PC-HW-Monitor v2.5"
    ```
 2. Jalankan skrip monitor:
    ```bash
