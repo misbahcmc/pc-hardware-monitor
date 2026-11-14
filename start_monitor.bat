@@ -1,10 +1,10 @@
 @echo off
-title PC Hardware Monitor Server (ViewHP)
+title PC Hardware Monitor Server (Android dan iOS)
 color 0A
 cd /d "%~dp0"
 
 echo ========================================================
-echo    Menyiapkan PC Hardware Monitor untuk Android...
+echo    Menyiapkan PC Hardware Monitor (Android dan iOS)...
 echo ========================================================
 
 :: 1. Deteksi Python di sistem
@@ -37,6 +37,9 @@ if %ERRORLEVEL% NEQ 0 (
         exit /b 1
     )
 )
+
+:: 2.5 Jalankan background service hardware sensor (MSI Afterburner) jika tersedia untuk sensor suhu CPU real-time
+powershell -Command "Start-ScheduledTask -TaskName 'MSIAfterburner' -ErrorAction SilentlyContinue" >nul 2>nul
 
 :: 3. Jalankan server pemantauan
 echo [*] Memulai server...

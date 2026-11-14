@@ -115,6 +115,7 @@
 
     .header-actions {
       display: flex;
+      align-items: center;
       gap: 8px;
     }
 
@@ -144,10 +145,10 @@
       flex: 1;
     }
 
-    /* Top Row: Clock, CPU, RAM, GPU */
+    /* Top Row: Clock, CPU, GPU, RAM, FPS */
     .row-top {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 10px;
     }
 
@@ -396,7 +397,29 @@
       padding: 2px 6px;
       border-radius: 4px;
       font-family: var(--font-mono);
+      transition: all 0.3s;
     }
+
+    .monitor-hz.game-fps-pill {
+      background: rgba(0, 230, 118, 0.15);
+      color: var(--cpu-color);
+      border: 1px solid rgba(0, 230, 118, 0.4);
+      box-shadow: 0 0 8px rgba(0, 230, 118, 0.2);
+    }
+
+    .monitor-hz.app-fps-pill {
+      background: rgba(0, 229, 255, 0.15);
+      color: #00e5ff;
+      border: 1px solid rgba(0, 229, 255, 0.4);
+      box-shadow: 0 0 8px rgba(0, 229, 255, 0.2);
+    }
+
+    .monitor-card.monitor-card-active {
+      border: 1px solid rgba(0, 230, 118, 0.4);
+      box-shadow: 0 0 10px rgba(0, 230, 118, 0.15);
+    }
+
+
 
     .monitor-app {
       font-size: 11px;
@@ -475,8 +498,11 @@
       .row-top {
         grid-template-columns: 1fr 1fr;
       }
+      .card.clock-card {
+        grid-column: span 2;
+      }
       .clock-time {
-        font-size: 22px;
+        font-size: 26px;
       }
       .card-tag {
         font-size: 10px;
@@ -574,6 +600,22 @@
         <div class="card-subtext" id="gpu-sub">-- · --°C</div>
       </div>
 
+      <!-- In-Game FPS Card -->
+      <div class="card fps-card">
+        <div class="card-tag" id="fps-card-tag">IN-GAME FPS</div>
+        <div class="gauge-container">
+          <svg class="gauge-svg" viewBox="0 0 100 100">
+            <circle class="gauge-bg" cx="50" cy="50" r="40" />
+            <circle class="gauge-progress" id="fps-ring" cx="50" cy="50" r="40" stroke="var(--cpu-color)" />
+          </svg>
+          <div class="gauge-center-text">
+            <div class="gauge-label" id="fps-gauge-label">FPS</div>
+            <div class="gauge-value" id="fps-val">--</div>
+          </div>
+        </div>
+        <div class="card-subtext" id="fps-sub">Standby Game 3D</div>
+      </div>
+
     </div>
 
     <!-- Bottom Row: Top Processes, Displays & Active App, Network & Storage -->
@@ -592,7 +634,7 @@
       <!-- Displays & Foreground App -->
       <div class="panel">
         <div class="panel-header">
-          <div class="panel-title">🖥️ Monitor & Aplikasi Aktif</div>
+          <div class="panel-title">🖥️ Layar & Tampilan</div>
         </div>
         <div id="monitors-list">
           <div class="monitor-card">
@@ -747,7 +789,8 @@
 
     function renderStats(data) {
       if (data.hostname && data.ip) {
-        document.getElementById('host-info').textContent = `${data.hostname} (${data.ip})`;
+        const osLabel = data.os ? `[${data.os}] ` : '';
+        document.getElementById('host-info').textContent = `${osLabel}${data.hostname} (${data.ip})`;
       }
 
       if (data.uptime) {
@@ -763,12 +806,121 @@
         document.getElementById('cpu-name').textContent = data.cpu_model;
         document.getElementById('cpu-name').title = data.cpu_model;
       }
-      const cpuFreq = data.cpu_freq ? `${data.cpu_freq} GHz` : '--';
+      const cpuFreq = (data.cpu_freq !== null && data.cpu_freq !== undefined)
+        ? (typeof data.cpu_freq === 'number' ? data.cpu_freq.toFixed(2) + ' GHz' : `${data.cpu_freq} GHz`)
+        : '--';
       const coresInfo = (data.cpu_cores && data.cpu_threads) ? `${data.cpu_cores}C/${data.cpu_threads}T` : '';
-      if (data.cpu_temp) {
-        document.getElementById('cpu-sub').textContent = `${data.cpu_temp}°C · ${cpuFreq}`;
+      
+      const cpuTempVal = (data.cpu_temp !== null && data.cpu_temp !== undefined) ? data.cpu_temp : null;
+      let tempColor = 'var(--cpu-color)';
+      if (cpuTempVal !== null) {
+        if (cpuTempVal >= 80) tempColor = 'var(--danger-color)';
+        else if (cpuTempVal >= 68) tempColor = 'var(--warning-color)';
+        document.getElementById('cpu-sub').innerHTML = `<span style="color:${tempColor}; font-weight:700;">${cpuTempVal}°C</span> · ${cpuFreq} · ${coresInfo}`;
       } else {
         document.getElementById('cpu-sub').textContent = coresInfo ? `${cpuFreq} · ${coresInfo}` : cpuFreq;
+      }
+
+      // Gaming & Active Monitor FPS Telemetry
+      const gaming = data.gaming || {};
+      const monitors = data.monitors || [];
+
+      // Cari monitor yang sedang aktif (tempat game/aplikasi berjalan)
+      const activeMon = monitors.find(m => m.is_active) || monitors.find(m => m.is_primary) || (monitors.length > 0 ? monitors[0] : { hz: 60, fps: 60, device: 'Display', name: 'Monitor 1' });
+      const activeHz = activeMon.hz || 60;
+      const activeDev = activeMon.device || activeMon.name || 'Display';
+
+      const hasLiveFps = Boolean(gaming.has_live_fps && gaming.fps && gaming.fps > 0);
+      const isGame = Boolean(gaming.is_game || (gaming.active && gaming.game));
+      const isApp = Boolean(gaming.is_app && !isGame);
+
+      // In-game FPS ditarik langsung dari telemetri real-time game / monitor aktif
+      const curFps = hasLiveFps ? Math.round(gaming.fps) : activeHz;
+      const ftVal = (hasLiveFps && gaming.frametime) ? `${gaming.frametime} ms` : `${(1000 / Math.max(activeHz, 1)).toFixed(1)} ms`;
+
+      // Update Top Row FPS Card
+      const fpsValEl = document.getElementById('fps-val');
+      const fpsRingEl = document.getElementById('fps-ring');
+      const fpsCardTag = document.getElementById('fps-card-tag');
+      const fpsSub = document.getElementById('fps-sub');
+      const fpsGaugeLabel = document.getElementById('fps-gauge-label');
+      
+      if (fpsValEl) {
+        if (isGame) {
+          if (hasLiveFps) {
+            fpsValEl.innerHTML = `${curFps}`;
+            const fpsGaugePercent = Math.min(100, Math.round((curFps / Math.max(activeHz, 60)) * 100));
+            setGauge('fps-ring', fpsGaugePercent, 'var(--cpu-color)');
+
+            if (fpsCardTag) {
+              fpsCardTag.textContent = `🎮 IN-GAME FPS · ${activeDev}`;
+              fpsCardTag.style.color = 'var(--cpu-color)';
+            }
+            if (fpsGaugeLabel) {
+              fpsGaugeLabel.textContent = 'FPS';
+              fpsGaugeLabel.style.color = 'var(--cpu-color)';
+            }
+            if (fpsSub) {
+              const gName = gaming.game || '3D Game';
+              fpsSub.innerHTML = `<span style="color:var(--cpu-color); font-weight:700;">${gName}</span> · ${ftVal} · Layar ${activeDev} (${activeHz} Hz)`;
+            }
+          } else {
+            // Game terdeteksi aktif, menunggu stream FPS live dari MangoHud / RTSS
+            fpsValEl.innerHTML = `${activeHz}`;
+            setGauge('fps-ring', 100, '#00e5ff');
+
+            if (fpsCardTag) {
+              fpsCardTag.textContent = `🎮 GAME DETECTED · ${activeDev}`;
+              fpsCardTag.style.color = '#00e5ff';
+            }
+            if (fpsGaugeLabel) {
+              fpsGaugeLabel.textContent = 'Hz';
+              fpsGaugeLabel.style.color = '#00e5ff';
+            }
+            if (fpsSub) {
+              const gName = gaming.game || '3D Game';
+              fpsSub.innerHTML = `<span style="color:#00e5ff; font-weight:700;">${gName}</span> · Layar ${activeDev} (${activeHz} Hz) · <span style="color:#ffb74d" title="Tekan Left Shift + F2 pada game untuk mulai kirim log FPS live MangoHud">Tekan Shift+F2 utk FPS Live</span>`;
+            }
+          }
+        } else if (isApp) {
+          fpsValEl.innerHTML = `${curFps}`;
+          const fpsGaugePercent = Math.min(100, Math.round((curFps / Math.max(activeHz, 60)) * 100));
+          setGauge('fps-ring', fpsGaugePercent, '#00e5ff');
+
+          const appName = (gaming.app || 'App').toUpperCase();
+          if (fpsCardTag) {
+            fpsCardTag.textContent = `⚡ APP FPS · ${appName}`;
+            fpsCardTag.style.color = '#00e5ff';
+          }
+          if (fpsGaugeLabel) {
+            fpsGaugeLabel.textContent = 'FPS';
+            fpsGaugeLabel.style.color = '#00e5ff';
+          }
+          if (fpsSub) {
+            const rawTitle = gaming.title || gaming.app || 'App';
+            const shortTitle = rawTitle.length > 24 ? rawTitle.substring(0, 24) + '...' : rawTitle;
+            fpsSub.innerHTML = `<span style="color:#00e5ff; font-weight:600;">${shortTitle}</span> · ${ftVal} · Layar ${activeDev}`;
+          }
+        } else {
+          fpsValEl.innerHTML = `${hasLiveFps && curFps > 0 ? curFps : activeHz}`;
+          const fpsGaugePercent = hasLiveFps ? Math.min(100, Math.round((curFps / Math.max(activeHz, 60)) * 100)) : 100;
+          setGauge('fps-ring', fpsGaugePercent, '#4da3ff');
+
+          if (fpsCardTag) {
+            fpsCardTag.textContent = hasLiveFps ? `⚡ SCREEN FPS · ${activeDev}` : `DESKTOP REFRESH · ${activeDev}`;
+            fpsCardTag.style.color = hasLiveFps ? '#00e5ff' : 'var(--text-muted)';
+          }
+          if (fpsGaugeLabel) {
+            fpsGaugeLabel.textContent = hasLiveFps ? 'FPS' : 'Hz';
+            fpsGaugeLabel.style.color = hasLiveFps ? '#00e5ff' : 'var(--text-muted)';
+          }
+          const primaryMaxHz = activeMon.max_hz || activeHz;
+          if (primaryMaxHz > activeHz) {
+            fpsSub.innerHTML = `Layar ${activeDev} (${activeHz} Hz) · <span style="color:#ffb74d" title="Monitor mendukung hingga ${primaryMaxHz}Hz">Max ${primaryMaxHz} Hz ⚠️</span>`;
+          } else {
+            fpsSub.innerHTML = `Layar ${activeDev} (${activeHz} Hz)${hasLiveFps ? ` · ${ftVal}` : ' · Standby'}`;
+          }
+        }
       }
 
       // RAM
@@ -791,26 +943,53 @@
 
       // Top Processes
       if (data.processes && data.processes.length > 0) {
-        const procListHtml = data.processes.slice(0, 5).map(p => `
-          <div class="proc-item">
-            <span class="proc-name" title="${p.name}">${p.name}</span>
-            <span class="proc-cpu">${p.cpu.toFixed(1)}%</span>
-          </div>
-        `).join('');
+        const procListHtml = data.processes.slice(0, 5).map(p => {
+          const clampedCpu = Math.min(100, Math.max(0, p.cpu || 0)).toFixed(1);
+          return `
+            <div class="proc-item">
+              <span class="proc-name" title="${p.name}">${p.name}</span>
+              <span class="proc-cpu">${clampedCpu}%</span>
+            </div>
+          `;
+        }).join('');
         document.getElementById('proc-list').innerHTML = procListHtml;
       }
 
       // Displays & Monitors
       if (data.monitors && data.monitors.length > 0) {
-        const monHtml = data.monitors.map(m => `
-          <div class="monitor-card">
-            <div class="monitor-top">
-              <span class="monitor-name">${m.name}</span>
-              <span class="monitor-hz">${m.hz} Hz</span>
+        const monHtml = data.monitors.map(m => {
+          let hzBadge = `<span class="monitor-hz">${m.hz} Hz</span>`;
+          if (m.is_game_fps) {
+            hzBadge = `<span class="monitor-hz game-fps-pill">🎮 ${m.fps} FPS</span>`;
+          } else if (m.is_app_fps) {
+            hzBadge = `<span class="monitor-hz app-fps-pill">⚡ ${m.fps} FPS</span>`;
+          } else if (m.max_hz && m.max_hz > m.hz) {
+            hzBadge = `<span class="monitor-hz" style="border: 1px solid #ffb74d; color: #ffb74d;" title="Monitor mendukung hingga ${m.max_hz}Hz">${m.hz} Hz <small style="opacity:0.8">(Max ${m.max_hz}Hz)</small></span>`;
+          }
+
+          let setHzBtn = '';
+          if (!m.is_game_fps && !m.is_app_fps && m.max_hz && m.max_hz > m.hz) {
+            setHzBtn = `<button onclick="setMonitorHz(${m.max_hz}, '${m.device || ''}')" style="background:rgba(255,183,77,0.15);border:1px solid #ffb74d;color:#ffb74d;border-radius:4px;padding:2px 6px;font-size:10px;font-weight:700;cursor:pointer;margin-left:6px;" title="Klik untuk ubah refresh rate monitor ke ${m.max_hz}Hz">⚡ Set ${m.max_hz}Hz</button>`;
+          }
+
+          let statusBadges = '';
+          if (m.is_active) {
+            statusBadges += ' <span style="font-size:10px;background:rgba(0,230,118,0.2);color:var(--cpu-color);padding:1px 5px;border-radius:3px;font-weight:bold;border:1px solid rgba(0,230,118,0.4);" title="Monitor yang sedang aktif digunakan">[AKTIF]</span>';
+          }
+          if (m.is_primary) {
+            statusBadges += ' <span style="font-size:10px;color:#4da3ff;font-weight:bold;">[UTAMA]</span>';
+          }
+
+          return `
+            <div class="monitor-card${m.is_active ? ' monitor-card-active' : ''}">
+              <div class="monitor-top">
+                <span class="monitor-name">${m.name}${statusBadges}${setHzBtn}</span>
+                ${hzBadge}
+              </div>
+              <div class="monitor-app">Top: <span class="monitor-app-active">${m.app || 'Desktop'}</span></div>
             </div>
-            <div class="monitor-app">Top: <span class="monitor-app-active">${m.app || 'Desktop'}</span></div>
-          </div>
-        `).join('');
+          `;
+        }).join('');
         document.getElementById('monitors-list').innerHTML = monHtml;
       }
 
@@ -825,7 +1004,7 @@
         const disksHtml = data.disks.map(d => `
           <div class="disk-item">
             <div class="disk-label">
-              <span>Drive ${d.device}</span>
+              <span>${d.device.startsWith('Drive ') || d.device.startsWith('Disk ') ? d.device : 'Disk ' + d.device}</span>
               <span>${d.used_gb} / ${d.total_gb} GB (${d.percent}%)</span>
             </div>
             <div class="disk-progress-bg">
@@ -834,6 +1013,20 @@
           </div>
         `).join('');
         document.getElementById('disks-list').innerHTML = disksHtml;
+      }
+    }
+
+    async function setMonitorHz(targetHz, device = '') {
+      if (!confirm(`Ubah refresh rate monitor menjadi ${targetHz} Hz?`)) return;
+      try {
+        let url = `/api/set_hz?hz=${targetHz}`;
+        if (device) url += `&device=${encodeURIComponent(device)}`;
+        const res = await fetch(url);
+        const json = await res.json();
+        alert(json.message || (json.success ? `Berhasil diubah ke ${targetHz} Hz!` : 'Gagal'));
+        fetchStats();
+      } catch (e) {
+        alert('Gagal menghubungi server untuk mengubah refresh rate.');
       }
     }
 
