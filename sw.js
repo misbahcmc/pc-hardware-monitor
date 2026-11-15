@@ -1,5 +1,5 @@
 // Service Worker for PC Hardware Monitor PWA
-const CACHE_NAME = 'pc-monitor-cache-v9';
+const CACHE_NAME = 'pc-monitor-cache-v10';
 const STATIC_ASSETS = [
   '/',
   '/manifest.json'

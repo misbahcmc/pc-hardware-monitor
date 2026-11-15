@@ -4,6 +4,37 @@ Semua catatan perubahan dan pembaruan penting pada proyek PC Hardware Monitor di
 
 ---
 
+## [2.6.0] - 15 November 2026
+
+### 🎮 Peningkatan Utama & Sinkronisasi Presisi FPS (Major Improvements)
+- **Pelacakan Hardware Present Game Super Akurat (`NvPresentTracker`)**:
+  - **Aktivasi Streaming Present() Sesi FrameView**: Memperbaiki pemanggilan antarmuka vtbl SDK (`fn_start` dan `fn_stop`) sehingga driver GPU secara aktif mengalirkan setiap frame swapchain DirectX 9/10/11/12 & Vulkan melalui named pipe inter-process.
+  - **Sinkronisasi Penuh 1:1 dengan In-Game Counter**: Mengeliminasi lonjakan angka FPS palsu akibat *batching* pembacaan buffer pipe. Kalkulasi FPS kini didasarkan langsung pada hardware timestamp `MsBetweenPresents` dari driver kernel NVIDIA (`1000 / avg_ms`), tersinkronisasi presisi dengan overlay game (Steam, RTSS, atau FPS meter bawaan game).
+  - **Perbaikan Bug Pipe Worker**: Memperbaiki dependensi impor `from collections import deque` di `app.py` yang sebelumnya memicu `NameError` dan menghentikan pembacaan frame.
+  - **Terverifikasi Live**: Berhasil diuji dan divalidasi langsung pada game 3D intensif (*Devil May Cry 5*: 137 FPS @ 7.3 ms frametime).
+
+- **Fokus Pelacakan Eksklusif Aplikasi / Game Teratas (Foreground Only)**:
+  - Menghilangkan gangguan deteksi FPS dari aplikasi di latar belakang (*background processes* seperti browser terminimalkan, Discord, atau launcher).
+  - Sistem kini secara cerdas mengikat kalkulasi FPS hanya ke jendela proses yang sedang aktif di latar depan pengguna (`GetForegroundWindow()`).
+  - **Bebas Batasan Refresh Rate Layar**: Mengatasi keluhan FPS mentok di 180 Hz pada monitor 180 Hz. Game dengan unlocked frame rate kini dapat menampilkan angka render aktual di atas 180 FPS.
+
+- **Adaptif 3-Mode UI & Indikator Visual Dinamis**:
+  - `🎮 IN-GAME FPS` (Cincin Hijau Neon): Aktif saat game 3D terdeteksi; menampilkan FPS aktual, nama executable game (misal `DevilMayCry5.exe`), dan *frametime* latensi render (ms).
+  - `⚡ APP FPS` (Cincin Sian / Cyan): Aktif saat pengguna berinteraksi di aplikasi produktivitas (Brave, Chrome, media player, dsb.) yang sedang aktif merender frame grafis.
+  - `🖥️ DESKTOP IDLE` (Cincin Biru Klasik): Saat berada di desktop atau jendela statis tanpa render frame aktif, ring otomatis beralih ke warna biru dengan nominal refresh rate monitor asli (misal `180 Hz`) tanpa menampilkan badge game palsu.
+
+- **Dukungan Penuh Multi-Vendor GPU (AMD Radeon & Intel Arc)**:
+  - **Native Windows DXGI Engine (`_init_dxgi`)**: Mengimplementasikan enumerasi adapter DirectX Graphics Infrastructure (`dxgi.dll` via ctypes) bawaan Windows tanpa ketergantungan library pihak ketiga. Secara otomatis membaca nama resmi GPU (*AMD Radeon RX 7800 XT, Intel Arc A770, dsb.*) dan total kapasitas dedicated VRAM.
+  - **MSI Afterburner Shared Memory (`MAHMSharedMemory`)**: Menambahkan jalur telemetri pembacaan Suhu (°C), GPU Usage (%), dan pemakaian VRAM secara real-time untuk kartu grafis AMD Radeon dan Intel Arc di Windows.
+  - **Linux Driver Mesa ANV / RADV**: Mendukung telemetri otomatis sysfs kernel DRM Linux dan compositor KWin Wayland.
+
+- **Pembersihan Folder & Optimasi Repack Distribusi Proyek**:
+  - Menghapus 15 file sampah capture test `FvSDK*.csv` yang sempat terbuat saat pengujian awal.
+  - Menghapus file draft lama `windows_implementation_plan.md` dan cache bytecode `__pycache__`.
+  - Mengurangi ukuran arsip rilis zip dari ~175 KB menjadi ~71 KB (penurunan ukuran > 59%).
+
+---
+
 ## [2.5.0] - 15 November 2026
 
 ### 🎮 Fitur Baru & Peningkatan Utama (Major New Features)

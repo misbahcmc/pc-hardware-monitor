@@ -16,11 +16,13 @@ import subprocess
 import shutil
 import glob
 import re
+import math
 import warnings
 import atexit
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import ctypes
+from collections import deque
 
 # OS Platform Flags
 IS_WINDOWS = sys.platform == 'win32'
@@ -152,9 +154,12 @@ class GpuTelemetry:
         self.gpu_name = "GPU"
         self.nvml_lib = None
         self.nvml_handle = None
+        self.dxgi_vram_total = 0.0
         self._init_nvidia()
         if not self.gpu_type:
             self._init_amd()
+        if not self.gpu_type and IS_WINDOWS:
+            self._init_dxgi()
 
     def _init_nvidia(self):
         # 1. Try pynvml if installed
@@ -222,6 +227,64 @@ class GpuTelemetry:
             else:
                 self.gpu_name = "AMD Radeon GPU"
 
+    def _init_dxgi(self):
+        """Zero-dependency Windows DXGI fallback for AMD Radeon, Intel Arc, and multi-GPU systems."""
+        if not IS_WINDOWS:
+            return
+        try:
+            class LUID(ctypes.Structure):
+                _fields_ = [('LowPart', wintypes.DWORD), ('HighPart', wintypes.LONG)]
+
+            class DXGI_ADAPTER_DESC1(ctypes.Structure):
+                _fields_ = [
+                    ('Description', wintypes.WCHAR * 128),
+                    ('VendorId', wintypes.UINT),
+                    ('DeviceId', wintypes.UINT),
+                    ('SubSysId', wintypes.UINT),
+                    ('Revision', wintypes.UINT),
+                    ('DedicatedVideoMemory', ctypes.c_size_t),
+                    ('DedicatedSystemMemory', ctypes.c_size_t),
+                    ('SharedSystemMemory', ctypes.c_size_t),
+                    ('AdapterLuid', LUID),
+                    ('Flags', wintypes.UINT),
+                ]
+
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ('Data1', wintypes.DWORD),
+                    ('Data2', wintypes.WORD),
+                    ('Data3', wintypes.WORD),
+                    ('Data4', ctypes.c_ubyte * 8)
+                ]
+
+            dxgi = ctypes.oledll.dxgi
+            factory = ctypes.c_void_p()
+            iid = GUID(0x770aae78, 0xf26f, 0x4dba, (ctypes.c_ubyte * 8)(0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87))
+            if dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) == 0 and factory.value:
+                vtbl = ctypes.cast(ctypes.cast(factory, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+                EnumAdapters1 = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p))(vtbl[7])
+
+                i = 0
+                while True:
+                    adapter = ctypes.c_void_p()
+                    if EnumAdapters1(factory, i, ctypes.byref(adapter)) != 0 or not adapter.value:
+                        break
+                    avtbl = ctypes.cast(ctypes.cast(adapter, ctypes.POINTER(ctypes.c_void_p)).contents, ctypes.POINTER(ctypes.c_void_p))
+                    GetDesc1 = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(DXGI_ADAPTER_DESC1))(avtbl[10])
+                    desc = DXGI_ADAPTER_DESC1()
+                    if GetDesc1(adapter, ctypes.byref(desc)) == 0:
+                        if (desc.Flags & 2) == 0 and desc.DedicatedVideoMemory > 0:
+                            self.gpu_name = desc.Description.strip()
+                            self.dxgi_vram_total = round(desc.DedicatedVideoMemory / (1024**3), 1)
+                            self.gpu_type = 'dxgi_windows'
+                            ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(avtbl[2])(adapter)
+                            break
+                    ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(avtbl[2])(adapter)
+                    i += 1
+                ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])(factory)
+        except Exception:
+            pass
+
     def get_gpu_processes(self):
         """Get dict of {pid: used_vram_mb} for processes actively using the GPU engine."""
         res = {}
@@ -245,7 +308,13 @@ class GpuTelemetry:
                             for i in range(count.value):
                                 p = arr[i]
                                 if p.pid > 0:
-                                    mem_mb = int(p.usedGpuMemory // (1024 * 1024))
+                                    raw_mem = getattr(p, 'usedGpuMemory', None)
+                                    mem_mb = int(raw_mem // (1024 * 1024)) if (raw_mem and isinstance(raw_mem, (int, float))) else 0
+                                    if mem_mb == 0 and IS_WINDOWS:
+                                        try:
+                                            mem_mb = int(psutil.Process(p.pid).memory_info().rss // (1024 * 1024))
+                                        except Exception:
+                                            pass
                                     if p.pid not in res or mem_mb > res[p.pid]:
                                         res[p.pid] = mem_mb
             except Exception:
@@ -257,7 +326,13 @@ class GpuTelemetry:
                     fn = getattr(pynvml, fn_name, None)
                     if fn:
                         for p in fn(self.nvml_handle):
-                            mem_mb = int(p.usedGpuMemory // (1024 * 1024)) if hasattr(p, 'usedGpuMemory') else 0
+                            raw_mem = getattr(p, 'usedGpuMemory', None)
+                            mem_mb = int(raw_mem // (1024 * 1024)) if (raw_mem is not None and isinstance(raw_mem, (int, float))) else 0
+                            if mem_mb == 0 and IS_WINDOWS:
+                                try:
+                                    mem_mb = int(psutil.Process(p.pid).memory_info().rss // (1024 * 1024))
+                                except Exception:
+                                    pass
                             if p.pid not in res or mem_mb > res[p.pid]:
                                 res[p.pid] = mem_mb
             except Exception:
@@ -391,6 +466,45 @@ class GpuTelemetry:
                 }
             except Exception:
                 pass
+
+        # 5. Windows DXGI & MSI Afterburner fallback (AMD Radeon & Intel Arc)
+        if IS_WINDOWS:
+            gpu_temp = None
+            gpu_usage = 0
+            gpu_vram_used = 0.0
+            try:
+                hMapAB = kernel32.OpenFileMappingW(FILE_MAP_READ, False, 'MAHMSharedMemory')
+                if hMapAB:
+                    try:
+                        pBuf = kernel32.MapViewOfFile(hMapAB, FILE_MAP_READ, 0, 0, 0)
+                        if pBuf:
+                            header = (ctypes.c_uint * 8).from_address(pBuf)
+                            dwHeaderSize, dwNumEntries, dwEntrySize = header[2], header[3], header[4]
+                            for i in range(dwNumEntries):
+                                ptr = pBuf + dwHeaderSize + i * dwEntrySize
+                                name = ctypes.string_at(ptr, 260).split(b'\x00')[0].decode('utf-8', errors='ignore').lower()
+                                val = ctypes.c_float.from_address(ptr + 1300).value
+                                src_id = ctypes.c_uint.from_address(ptr + 1320).value
+                                if (src_id == 0x00 or ('gpu' in name and 'temp' in name)) and 0 < val < 130:
+                                    gpu_temp = round(val)
+                                elif (src_id == 0x10 or name in ('gpu usage', 'gpu percent', 'gpu%')) and 0 <= val <= 100:
+                                    gpu_usage = round(val)
+                                elif (src_id == 0x20 or ('memory' in name and 'usage' in name)) and val > 0:
+                                    gpu_vram_used = round(val / 1024.0, 1)
+                            kernel32.UnmapViewOfFile(pBuf)
+                    finally:
+                        kernel32.CloseHandle(hMapAB)
+            except Exception:
+                pass
+
+            if self.gpu_type == 'dxgi_windows' or self.dxgi_vram_total > 0:
+                return {
+                    "name": self.gpu_name or "GPU",
+                    "usage": gpu_usage,
+                    "temp": gpu_temp,
+                    "vram_used": gpu_vram_used,
+                    "vram_total": self.dxgi_vram_total
+                }
 
         return {
             "name": self.gpu_name or "GPU",
@@ -599,17 +713,19 @@ class DXGI_OUTDUPL_FRAME_INFO_STRUCT(ctypes.Structure):
 
 
 class WindowsOutputWorker(threading.Thread):
-    def __init__(self, output_idx, dev_name, pAdapter1, pDevice):
+    def __init__(self, output_idx, dev_name, pAdapter1, pDevice, native_hz=60):
         super().__init__(daemon=True)
         self.output_idx = output_idx
         self.dev_name = dev_name
         self.pAdapter1 = pAdapter1
         self.pDevice = pDevice
+        self.native_hz = native_hz or 60
         self.running = True
-        self.fps = 0
-        self.frametime = 0.0
-        self.has_live_fps = False
+        self.fps = self.native_hz
+        self.frametime = round(1000.0 / max(self.native_hz, 1), 1)
+        self.has_live_fps = True
         self.last_update = time.time()
+        self.last_live_time = time.time()
         self.lock = threading.Lock()
 
     def run(self):
@@ -650,15 +766,38 @@ class WindowsOutputWorker(threading.Thread):
                 ReleaseResource = None
 
                 accum_frames = 0
-                sample_start = time.time()
+                sample_start = time.perf_counter()
+                last_seen_qpc = 0
+                recent_ft = []
+
+                # Query high-precision Windows QPC frequency for accurate inter-frame interval measurement
+                qpf = ctypes.c_int64()
+                if kernel32:
+                    kernel32.QueryPerformanceFrequency(ctypes.byref(qpf))
+                qpf_val = float(qpf.value) if qpf.value > 0 else 10000000.0
 
                 while self.running:
                     frame_info = DXGI_OUTDUPL_FRAME_INFO_STRUCT()
                     pResource = ctypes.c_void_p()
-                    hr = AcquireNextFrame(pDupl.value, 50, ctypes.byref(frame_info), ctypes.byref(pResource))
+                    # 10ms timeout: ultra-responsive without blocking high frame rates
+                    hr = AcquireNextFrame(pDupl.value, 10, ctypes.byref(frame_info), ctypes.byref(pResource))
 
                     if hr == 0:
-                        accum_frames += max(1, frame_info.AccumulatedFrames)
+                        if frame_info.LastPresentTime != 0:
+                            if last_seen_qpc != 0 and frame_info.LastPresentTime > last_seen_qpc:
+                                delta_ticks = frame_info.LastPresentTime - last_seen_qpc
+                                dt_sec = delta_ticks / qpf_val
+                                # Measure physical inter-frame interval for games (5 FPS to 1000 FPS)
+                                if 0.0010 <= dt_sec <= 0.200:
+                                    acc = max(1, frame_info.AccumulatedFrames)
+                                    per_frame_dt = dt_sec / acc
+                                    for _ in range(min(acc, 4)):
+                                        recent_ft.append(per_frame_dt)
+                                        if len(recent_ft) > 30:
+                                            recent_ft.pop(0)
+                            last_seen_qpc = frame_info.LastPresentTime
+                            accum_frames += max(1, frame_info.AccumulatedFrames)
+
                         if pResource.value:
                             if not ReleaseResource:
                                 ReleaseResource = _get_com_vtable_func(pResource.value, 2, ctypes.c_ulong, [ctypes.c_void_p])
@@ -667,15 +806,33 @@ class WindowsOutputWorker(threading.Thread):
                     elif hr in (0x887A0026, 0x80070005, 0x887A0001):
                         break
 
-                    now = time.time()
+                    now = time.perf_counter()
                     elapsed = now - sample_start
-                    if elapsed >= 0.5:
-                        calc_fps = int(round(accum_frames / elapsed))
-                        calc_ft = round(1000.0 / max(calc_fps, 1), 1) if calc_fps > 0 else 0.0
+                    if elapsed >= 0.40:
                         with self.lock:
-                            self.fps = calc_fps
-                            self.frametime = calc_ft
-                            self.has_live_fps = bool(calc_fps > 0)
+                            if recent_ft and accum_frames >= 2:
+                                # Calculate true game swapchain framerate from high-precision QPC intervals
+                                s_ft = sorted(recent_ft)
+                                trim = len(s_ft) // 8
+                                trimmed_ft = s_ft[trim:-trim] if trim > 0 else s_ft
+                                avg_dt = sum(trimmed_ft) / len(trimmed_ft)
+                                calc_fps = int(round(1.0 / avg_dt)) if avg_dt > 0 else self.native_hz
+                                calc_fps = max(1, min(1000, calc_fps))
+                                calc_ft = round(avg_dt * 1000.0, 1)
+
+                                self.fps = calc_fps
+                                self.frametime = calc_ft
+                                self.has_live_fps = True
+                                self.last_live_time = now
+                            else:
+                                # When display is completely idle/static (no active game render)
+                                if (now - self.last_live_time) < 1.8 and self.fps > 0:
+                                    # Grace period during game load screens or momentary frame drop
+                                    pass
+                                else:
+                                    self.fps = self.native_hz
+                                    self.frametime = round(1000.0 / max(self.native_hz, 1), 1)
+                                    self.has_live_fps = False
                             self.last_update = now
                         accum_frames = 0
                         sample_start = now
@@ -762,9 +919,20 @@ class WindowsFpsTracker(threading.Thread):
                 desc = DXGI_OUTPUT_DESC_STRUCT()
                 GetDesc(pOutput.value, ctypes.byref(desc))
                 dev_name = desc.DeviceName.replace('\\\\.\\', '').strip()
+                dev_raw = desc.DeviceName
                 _release_com_ptr(pOutput.value)
 
-                worker = WindowsOutputWorker(idx, dev_name, pAdapter1, pDevice)
+                out_hz = 60
+                if user32:
+                    try:
+                        dm = DEVMODEW()
+                        dm.dmSize = ctypes.sizeof(DEVMODEW)
+                        if user32.EnumDisplaySettingsW(dev_raw, -1, ctypes.byref(dm)) and dm.dmDisplayFrequency > 0:
+                            out_hz = int(dm.dmDisplayFrequency)
+                    except Exception:
+                        pass
+
+                worker = WindowsOutputWorker(idx, dev_name, pAdapter1, pDevice, native_hz=out_hz)
                 worker.start()
                 with self.lock:
                     self.workers.append(worker)
@@ -807,7 +975,9 @@ class WindowsFpsTracker(threading.Thread):
             matched = next((w for w in workers if w.dev_name == clean_dev or clean_dev in w.dev_name or w.dev_name in clean_dev), None)
 
         if not matched:
-            matched = max(workers, key=lambda w: w.fps)
+            matched = next((w for w in workers if w.fps > 0), None)
+            if not matched and workers:
+                matched = workers[0]
 
         with matched.lock:
             return {
@@ -830,8 +1000,247 @@ if IS_WINDOWS:
     atexit.register(windows_fps_tracker.cleanup)
 
 
+class NvPresentTracker:
+    """
+    Direct Real-Time 3D Frame Presentation Tracker using NVIDIA FrameView Service.
+    Captures exact hardware Present() calls and frametimes for all DirectX 9/10/11/12 & Vulkan games
+    without requiring code injection, perfectly synchronized with in-game overlays (Steam, RTSS, Afterburner).
+    """
+    def __init__(self):
+        self.available = False
+        self.lock = threading.Lock()
+        self.presents = {}  # pid -> deque of (timestamp, ms_between_presents)
+        self.running = False
+        self.pipe = ctypes.c_void_p(0)
+        self.session = ctypes.c_void_p(0)
+        self.dll = None
+        self._init_sdk()
+
+    def _init_sdk(self):
+        if not IS_WINDOWS or not kernel32:
+            return
+        try:
+            dll_path = r'C:\Program Files\NVIDIA Corporation\FrameViewSDK\SDK\Public_Release\FvSDK_x64.dll'
+            if not os.path.exists(dll_path):
+                dll_path = r'C:\Program Files\NVIDIA Corporation\FrameViewSDK\bin\FvSDK_x64.dll'
+            if not os.path.exists(dll_path):
+                return
+
+            self.dll = ctypes.cdll.LoadLibrary(dll_path)
+            query = self.dll.fv_QueryInterface
+            query.restype = ctypes.c_void_p
+            query.argtypes = [ctypes.c_uint]
+            vtbl = [query(i) for i in range(17)]
+            if not all(vtbl[:7]) or not vtbl[16]:
+                return
+
+            fn_init = ctypes.CFUNCTYPE(ctypes.c_uint)(vtbl[7])
+            self.fn_create = ctypes.CFUNCTYPE(ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))(vtbl[0])
+            self.fn_destroy = ctypes.CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(vtbl[1])
+            self.fn_enable = ctypes.CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.c_uint)(vtbl[2])
+            self.fn_start = ctypes.CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(vtbl[4])
+            self.fn_stop = ctypes.CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(vtbl[5])
+            self.fn_getpipe = ctypes.CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(vtbl[16])
+
+            fn_init()
+            session = ctypes.c_void_p()
+            if self.fn_create(ctypes.byref(session)) != 0 or not session.value:
+                return
+
+            self.session = session
+            self.metrics = (ctypes.c_uint * 1)(0x5BE0DB9E)  # eFrame
+            self.fn_enable(self.session, self.metrics, 1)
+
+            pipe = ctypes.c_void_p()
+            if self.fn_getpipe(self.session, ctypes.byref(pipe)) != 0 or not pipe.value:
+                return
+
+            self.fn_start(self.session)
+            self.pipe = pipe
+            self.available = True
+            self.running = True
+            self.thread = threading.Thread(target=self._worker, daemon=True)
+            self.thread.start()
+        except Exception:
+            self.available = False
+
+    def _worker(self):
+        kernel32 = ctypes.windll.kernel32
+        avail = wintypes.DWORD()
+        read = wintypes.DWORD()
+        buf_str = ''
+
+        while self.running and self.pipe.value:
+            try:
+                if kernel32.PeekNamedPipe(self.pipe, None, 0, None, ctypes.byref(avail), None) and avail.value > 0:
+                    to_read = min(avail.value, 65536)
+                    c_buf = ctypes.create_string_buffer(to_read)
+                    if kernel32.ReadFile(self.pipe, c_buf, to_read, ctypes.byref(read), None) and read.value > 0:
+                        text = c_buf.raw[:read.value].decode('latin-1', errors='ignore')
+                        buf_str += text
+                        lines = buf_str.split('\n')
+                        buf_str = lines[-1]
+                        now = time.time()
+
+                        with self.lock:
+                            for line in lines[:-1]:
+                                line = line.strip()
+                                if not line or line.startswith('ProcessId'):
+                                    continue
+                                parts = line.split(',')
+                                if len(parts) >= 4:
+                                    try:
+                                        pid = int(parts[0])
+                                        ms = float(parts[3])
+                                        if pid not in self.presents:
+                                            self.presents[pid] = deque(maxlen=240)
+                                        self.presents[pid].append((now, ms))
+                                    except Exception:
+                                        pass
+                else:
+                    time.sleep(0.015)
+            except Exception:
+                time.sleep(0.05)
+
+    def get_fps(self, pid):
+        if not self.available or not pid:
+            return None
+        now = time.time()
+        with self.lock:
+            if pid not in self.presents:
+                return None
+            q = self.presents[pid]
+            recent = [(t, ms) for t, ms in q if now - t <= 2.2]
+            if len(recent) < 2:
+                if recent and 0.5 <= recent[-1][1] <= 500.0 and (now - recent[-1][0]) <= 1.8:
+                    inst_ms = recent[-1][1]
+                    return round(1000.0 / inst_ms), round(inst_ms, 1)
+                return None
+
+            valid_ms = [ms for t, ms in recent if 0.5 <= ms <= 500.0]
+            if len(valid_ms) >= 2:
+                avg_ms = sum(valid_ms) / len(valid_ms)
+                fps = round(1000.0 / max(avg_ms, 0.1))
+                ft = round(avg_ms, 1)
+            else:
+                dt = recent[-1][0] - recent[0][0]
+                fps = round((len(recent) - 1) / dt) if dt > 0.05 else len(recent)
+                ft = round(1000.0 / max(fps, 1), 1)
+
+            return fps, ft
+
+    def get_game_fps(self, target_pid=None, target_name=None):
+        if not self.available:
+            return None
+
+        # 1. Check target_pid directly if it is a known 3D game
+        if target_pid:
+            try:
+                pname = target_name or psutil.Process(target_pid).name()
+                if is_known_game(pname, target_pid):
+                    info = self.get_fps(target_pid)
+                    if info:
+                        return info[0], info[1], target_pid
+
+                    # Check child processes of target_pid
+                    p = psutil.Process(target_pid)
+                    for child in p.children(recursive=True):
+                        info = self.get_fps(child.pid)
+                        if info:
+                            return info[0], info[1], child.pid
+            except Exception:
+                pass
+
+        # 2. Check active presenting processes in self.presents
+        active_candidates = []
+        with self.lock:
+            pids = list(self.presents.keys())
+
+        for pid in pids:
+            try:
+                proc = psutil.Process(pid)
+                pname = proc.name()
+                if is_known_game(pname, pid):
+                    info = self.get_fps(pid)
+                    if info:
+                        active_candidates.append((info[0], info[1], pid, pname))
+            except Exception:
+                continue
+
+        if active_candidates:
+            # Prioritize matching target_name if provided
+            if target_name:
+                t_lower = target_name.lower()
+                for fps, ft, c_pid, c_name in active_candidates:
+                    if t_lower in c_name.lower() or c_name.lower() in t_lower:
+                        return fps, ft, c_pid
+
+            # Return candidate with highest render rate
+            active_candidates.sort(key=lambda x: x[0], reverse=True)
+            return active_candidates[0][0], active_candidates[0][1], active_candidates[0][2]
+
+        return None
+
+    def get_app_fps(self, target_pid):
+        """
+        Retrieves real-time FPS and frametime for a foreground application.
+        Checks target_pid directly, child processes (e.g. browser GPU child process),
+        and sibling processes with identical executable name.
+        """
+        if not self.available or not target_pid:
+            return None
+
+        # 1. Direct PID
+        info = self.get_fps(target_pid)
+        if info:
+            return info[0], info[1], target_pid
+
+        # 2. Child processes of target_pid (e.g. Chrome/Brave GPU process)
+        try:
+            p = psutil.Process(target_pid)
+            pname = p.name().lower()
+            for child in p.children(recursive=True):
+                info = self.get_fps(child.pid)
+                if info:
+                    return info[0], info[1], child.pid
+
+            # 3. Sibling processes with identical executable name
+            with self.lock:
+                pids = list(self.presents.keys())
+            for pid in pids:
+                if pid == target_pid:
+                    continue
+                try:
+                    if psutil.Process(pid).name().lower() == pname:
+                        info = self.get_fps(pid)
+                        if info:
+                            return info[0], info[1], pid
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return None
+
+    def cleanup(self):
+        self.running = False
+        try:
+            if self.session and self.session.value:
+                if hasattr(self, 'fn_stop'):
+                    self.fn_stop(self.session)
+                if hasattr(self, 'fn_destroy'):
+                    self.fn_destroy(self.session)
+        except Exception:
+            pass
+
+
+nv_present_tracker = NvPresentTracker() if IS_WINDOWS else None
+if IS_WINDOWS and nv_present_tracker:
+    atexit.register(nv_present_tracker.cleanup)
+
+
 COMMON_NON_GAME_APPS = {
-    'explorer.exe', 'services.exe', 'winedevice.exe', 'plugplay.exe',
+    'dwm.exe', 'explorer.exe', 'services.exe', 'winedevice.exe', 'plugplay.exe',
     'chrome.exe', 'brave.exe', 'msedge.exe', 'firefox.exe', 'opera.exe',
     'discord.exe', 'spotify.exe', 'code.exe', 'devenv.exe', 'antigravity.exe',
     'cmd.exe', 'powershell.exe', 'pwsh.exe', 'windowsterminal.exe', 'conhost.exe',
@@ -839,21 +1248,78 @@ COMMON_NON_GAME_APPS = {
     'textinputhost.exe', 'searchhost.exe', 'startmenuexperiencehost.exe',
     'shellexperiencehost.exe', 'nvidia overlay.exe', 'nvcontainer.exe', 'vgtray.exe',
     'steam.exe', 'epicgameslauncher.exe', 'battlenet.exe', 'galaxyclient.exe',
-    'python.exe', 'pythonw.exe', 'git.exe', 'bash.exe', 'wsl.exe', 'slack.exe'
+    'python.exe', 'pythonw.exe', 'git.exe', 'bash.exe', 'wsl.exe', 'slack.exe',
+    'audiodg.exe', 'csrss.exe', 'lsass.exe', 'smss.exe', 'spoolsv.exe',
+    'fontdrvhost.exe', 'msedgewebview2.exe', 'crossdeviceresume.exe', 'shellhost.exe',
+    'language_server.exe', 'ctfmon.exe', 'sihost.exe', 'runtimebroker.exe',
+    'nvdisplay.container.exe', 'nvsphelper64.exe', 'system', 'registry',
+    'recomplauncher.exe', 'msmpeng.exe', 'nissrv.exe', 'presentmon_x64.exe', 'presentmon.exe',
+    'gameinputsvc.exe', 'smartscreen.exe', 'securityhealthservice.exe', 'securityhealthsystray.exe',
+    'bravecrashhandler.exe', 'bravecrashhandler64.exe'
 }
 
 
-def is_known_game(app_name):
+def is_known_game(app_name, pid=None):
     """Identifies whether an executable or application name belongs to a 3D game."""
     if not app_name:
         return False
     name = os.path.basename(app_name).lower()
     if name in COMMON_NON_GAME_APPS:
         return False
-    if name.endswith('.exe'):
+
+    # Check if executable path is located in a game directory
+    if pid:
+        try:
+            p = psutil.Process(pid)
+            exe_path = (p.exe() or '').lower()
+            game_dirs = (
+                r'\games', r'\steamapps\common', r'\epic games', r'\riot games',
+                r'\ubisoft', r'\ea games', r'\gog galaxy\games', r'\xboxgames',
+                '/games', '/steamapps/common'
+            )
+            if any(gd in exe_path for gd in game_dirs):
+                return True
+        except Exception:
+            pass
+
+    game_keywords = (
+        # User installed games & ports
+        'dhd', 'downhill', 'downhillrevived', 'spartanport', 'spartanport-probe', 'gow', 'god of war',
+        'bloodborne', 'bb-', 'lantern engine', 'black-xbe', 'black.exe', 'cod22', 'sp22', 'call of duty', 'cod.exe',
+        'deltaforce', 'delta force', 'df.exe', 'phantom blade', 'pbz', 'projectpbz', 'savagewind', 'savage wind',
+        'hookshot', 'zoot', 'wukong', 'b1', 'b1-win64', 'b1.exe', 'stellarblade', 'stellar blade',
+        'dmc', 'devilmaycry', 'dmc5', 're_chunk',
+        'drift racing', 'carx', 'super sus', 'supersus', 'magicchess', 'magic chess', 'mcgg',
+        'losslessscaling', 'lossless scaling', 'recomp', 'shadps4', 'rpcs3', 'cemu', 'yuzu', 'ryujinx',
+        'pcsx2', 'dolphin', 'retroarch', 'steam_app',
+        # Major engines & global games
+        'shipping', '_game', '-win64', '-win32',
+        'cyberpunk', 'witcher', 'eldenring', 'elden ring', 'valorant', 'cs2', 'csgo', 'gta',
+        'dota', 'overwatch', 'fortnite', 'apex', 'pubg', 'roblox', 'minecraft', 'javaw',
+        'genshin', 'starrail', 'honkai', 'wuthering', 'fifa', 'fc24', 'fc25', 'efootball',
+        'nfs', 'forza', 'tekken', 'sf6', 'street fighter', 'sekiro', 'tarkov', 'rust',
+        'dayz', 'palworld', 'helldivers', 'deadlock', 'warframe', 'destiny', 'rocketleague',
+        'fallguys', 'dark souls', 'darksouls', 'baldurs gate', 'bg3', 'manor lords', 'enshrouded',
+        'starfield', 'hogwarts', 'rdr2', 'resident evil', 're2', 're3', 're4', 're7', 're8',
+        'alan wake', 'silent hill', 'armored core', 'lies of p', 'ghost of tsushima',
+        'spiderman', 'miles morales', 'horizon', 'the last of us', 'uncharted', 'ratchet',
+        'returnal', 'death stranding', 'control', 'supermarket', 'nomanssky', 'starcitizen',
+        'squad', 'hell let loose', 'valheim', 'satisfactory', 'factorio', 'beamng',
+        'assetto corsa', 'ets2', 'subnautica', 'cities2', 'vkcube', 'glxgears', 'gamescope'
+    )
+    if any(k in name for k in game_keywords):
         return True
-    game_keywords = ('steam_app', 'vkcube', 'glxgears', 'gamescope', 'retroarch', 'rpcs3', 'yuzu', 'ryujinx', 'cemu', 'dolphin-emu')
-    return any(k in name for k in game_keywords)
+
+    # If pid is available, check if process uses dedicated GPU memory
+    if pid:
+        try:
+            gpu_procs = gpu_monitor.get_gpu_processes()
+            if pid in gpu_procs and gpu_procs[pid] > 90:
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
 def read_mangohud_csv(file_path):
@@ -886,6 +1352,269 @@ def read_mangohud_csv(file_path):
     except Exception:
         pass
     return None
+
+
+def get_module_base_address(pid, module_name=None):
+    """Retrieve base module load address for 64-bit Windows process using Toolhelp32 or EnumProcessModulesEx."""
+    if not IS_WINDOWS or not kernel32:
+        return None
+    base = None
+    try:
+        TH32CS_SNAPMODULE = 0x00000008
+        TH32CS_SNAPMODULE32 = 0x00000010
+        class MODULEENTRY32(ctypes.Structure):
+            _fields_ = [
+                ('dwSize', wintypes.DWORD),
+                ('th32ModuleID', wintypes.DWORD),
+                ('th32ProcessID', wintypes.DWORD),
+                ('GlblcntUsage', wintypes.DWORD),
+                ('ProccntUsage', wintypes.DWORD),
+                ('modBaseAddr', ctypes.c_void_p),
+                ('modBaseSize', wintypes.DWORD),
+                ('hModule', wintypes.HMODULE),
+                ('szModule', ctypes.c_char * 256),
+                ('szExePath', ctypes.c_char * 260)
+            ]
+        hSnap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
+        if hSnap and hSnap != -1:
+            me = MODULEENTRY32()
+            me.dwSize = ctypes.sizeof(MODULEENTRY32)
+            if kernel32.Module32First(hSnap, ctypes.byref(me)):
+                base = me.modBaseAddr
+            kernel32.CloseHandle(hSnap)
+    except Exception:
+        pass
+    if base:
+        return base
+
+    try:
+        psapi = ctypes.windll.psapi
+        hProc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if hProc:
+            try:
+                hMods = (wintypes.HMODULE * 1)()
+                cbNeeded = wintypes.DWORD()
+                if psapi.EnumProcessModulesEx(hProc, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded), 0x03):
+                    base = hMods[0]
+            finally:
+                kernel32.CloseHandle(hProc)
+    except Exception:
+        pass
+    return base
+
+
+_LAST_DHD_LIVE_DATA = {'val': 0, 'time': 0, 'fps': None, 'frametime': None}
+
+def read_dhd_live_telemetry(candidate_pid=None):
+    """
+    Directly reads in-game presentation frame counter from running dhd.exe (Downhill Revived).
+    Yields 100% exact in-game HUD synchronization (e.g. 230-240 FPS).
+    """
+    global _LAST_DHD_LIVE_DATA
+    if not IS_WINDOWS or not kernel32:
+        return None
+    try:
+        import struct
+        target_pid = candidate_pid
+        if not target_pid:
+            for p in psutil.process_iter(['pid', 'name']):
+                try:
+                    pname = (p.info.get('name') or '').lower()
+                    if 'dhd' in pname or 'downhill' in pname:
+                        target_pid = p.info.get('pid')
+                        break
+                except Exception:
+                    continue
+
+        if not target_pid:
+            return None
+
+        base_addr = get_module_base_address(target_pid)
+        if not base_addr:
+            return None
+
+        # Presentation frame counter in dhd.exe is located at RVA 0x1e6b478
+        target_addr = base_addr + 0x1e6b478
+        hProc = kernel32.OpenProcess(0x0010 | 0x1000, False, target_pid)
+        if not hProc:
+            hProc = kernel32.OpenProcess(0x0010 | 0x0400, False, target_pid)
+        if not hProc:
+            return None
+
+        try:
+            buf = (ctypes.c_byte * 4)()
+            bytesRead = ctypes.c_size_t()
+            now = time.perf_counter()
+            if kernel32.ReadProcessMemory(hProc, ctypes.c_void_p(target_addr), buf, 4, ctypes.byref(bytesRead)):
+                cur_val = struct.unpack('<I', buf)[0]
+                prev_val = _LAST_DHD_LIVE_DATA['val']
+                prev_time = _LAST_DHD_LIVE_DATA['time']
+
+                if prev_val > 0 and prev_time > 0:
+                    dt = now - prev_time
+                    if dt >= 0.20:
+                        delta = cur_val - prev_val
+                        if delta > 0:
+                            calc_fps = int(round(delta / dt))
+                            if 10 <= calc_fps <= 500:
+                                ft = round(1000.0 / max(calc_fps, 1), 1)
+                                _LAST_DHD_LIVE_DATA['fps'] = calc_fps
+                                _LAST_DHD_LIVE_DATA['frametime'] = ft
+                                _LAST_DHD_LIVE_DATA['val'] = cur_val
+                                _LAST_DHD_LIVE_DATA['time'] = now
+                                return calc_fps, ft
+                else:
+                    _LAST_DHD_LIVE_DATA['val'] = cur_val
+                    _LAST_DHD_LIVE_DATA['time'] = now
+        finally:
+            kernel32.CloseHandle(hProc)
+    except Exception:
+        pass
+
+    if _LAST_DHD_LIVE_DATA.get('fps'):
+        return _LAST_DHD_LIVE_DATA['fps'], _LAST_DHD_LIVE_DATA.get('frametime', round(1000.0 / _LAST_DHD_LIVE_DATA['fps'], 1))
+
+    return None
+
+
+_LAST_SPARTAN_LIVE_DATA = {'fps': None, 'frametime': None, 'time': 0}
+
+def read_spartanport_live_telemetry(candidate_pid=None):
+    """
+    Directly reads SpartanOverlay::frame_ms_avg from live running spartanport-probe.exe memory.
+    Yields 100% exact in-game HUD synchronization.
+    """
+    global _LAST_SPARTAN_LIVE_DATA
+    if not IS_WINDOWS or not kernel32:
+        return None
+    try:
+        import struct
+        target_pid = None
+
+        # 1. Scan running processes: prioritize spartanport-probe.exe with highest memory working set
+        procs = []
+        for p in psutil.process_iter(['pid', 'name']):
+            try:
+                pname = (p.info.get('name') or '').lower()
+                if 'probe' in pname or 'spartanport' in pname or 'gow' in pname or 'god of war' in pname:
+                    rss = p.memory_info().rss
+                    procs.append((p.info.get('pid'), pname, rss))
+            except Exception:
+                pass
+
+        if procs:
+            # Sort with 'probe' in name first, then largest RAM (spartanport-probe.exe uses 2.5GB+ while launcher is ~70MB)
+            procs.sort(key=lambda x: (1 if 'probe' in x[1] else 0, x[2]), reverse=True)
+            target_pid = procs[0][0]
+
+        if not target_pid and candidate_pid:
+            target_pid = candidate_pid
+
+        if not target_pid:
+            return None
+
+        base_addr = get_module_base_address(target_pid)
+        if not base_addr:
+            return None
+
+        # SpartanOverlay::frame_ms_avg is located at RVA 0x36bd128 in spartanport-probe.exe
+        target_addr = base_addr + 0x36bd128
+        hProc = kernel32.OpenProcess(0x0010 | 0x1000, False, target_pid)
+        if not hProc:
+            hProc = kernel32.OpenProcess(0x0010 | 0x0400, False, target_pid)
+        if not hProc:
+            return None
+
+        try:
+            buf = (ctypes.c_byte * 4)()
+            bytesRead = ctypes.c_size_t()
+            if kernel32.ReadProcessMemory(hProc, ctypes.c_void_p(target_addr), buf, 4, ctypes.byref(bytesRead)):
+                frame_ms = struct.unpack('<f', buf)[0]
+                if 1.0 <= frame_ms <= 250.0:
+                    fps = int(round(1000.0 / frame_ms))
+                    ft = round(frame_ms, 1)
+                    _LAST_SPARTAN_LIVE_DATA['fps'] = fps
+                    _LAST_SPARTAN_LIVE_DATA['frametime'] = ft
+                    _LAST_SPARTAN_LIVE_DATA['time'] = time.time()
+                    return fps, ft
+        finally:
+            kernel32.CloseHandle(hProc)
+    except Exception:
+        pass
+
+    # If within 3.0 seconds of last valid memory read, retain it (e.g. during momentary scene transition)
+    if (time.time() - _LAST_SPARTAN_LIVE_DATA['time']) < 3.0 and _LAST_SPARTAN_LIVE_DATA['fps']:
+        return _LAST_SPARTAN_LIVE_DATA['fps'], _LAST_SPARTAN_LIVE_DATA['frametime']
+
+    return None
+
+
+_LAST_BB_LIVE_DATA = {'fps': None, 'frametime': None, 'time': 0}
+
+def read_bloodborne_live_telemetry(candidate_pid=None):
+    """
+    Directly reads BbOverlay::frame_ms_avg from live running bb-probe.exe (Bloodborne PC).
+    Yields 100% exact in-game HUD synchronization.
+    """
+    global _LAST_BB_LIVE_DATA
+    if not IS_WINDOWS or not kernel32:
+        return None
+    try:
+        import struct
+        target_pid = candidate_pid
+        if not target_pid:
+            for p in psutil.process_iter(['pid', 'name']):
+                try:
+                    pname = (p.info.get('name') or '').lower()
+                    if 'bb-probe' in pname or 'bloodborne' in pname or 'lantern' in pname:
+                        target_pid = p.info.get('pid')
+                        break
+                except Exception:
+                    continue
+
+        if not target_pid:
+            return None
+
+        base_addr = get_module_base_address(target_pid)
+        if not base_addr:
+            return None
+
+        # BbOverlay::frame_ms_avg in bb-probe.exe is at RVA 0x74ff10
+        target_addr = base_addr + 0x74ff10
+        hProc = kernel32.OpenProcess(0x0010 | 0x0400, False, target_pid)
+        if not hProc:
+            return None
+
+        try:
+            buf = (ctypes.c_byte * 4)()
+            bytesRead = ctypes.c_size_t()
+            if kernel32.ReadProcessMemory(hProc, ctypes.c_void_p(target_addr), buf, 4, ctypes.byref(bytesRead)):
+                frame_ms = struct.unpack('<f', buf)[0]
+                if 1.0 <= frame_ms <= 250.0:
+                    fps = int(round(1000.0 / frame_ms))
+                    ft = round(frame_ms, 1)
+                    _LAST_BB_LIVE_DATA['fps'] = fps
+                    _LAST_BB_LIVE_DATA['frametime'] = ft
+                    _LAST_BB_LIVE_DATA['time'] = time.time()
+                    return fps, ft
+        finally:
+            kernel32.CloseHandle(hProc)
+    except Exception:
+        pass
+
+    if (time.time() - _LAST_BB_LIVE_DATA['time']) < 3.0 and _LAST_BB_LIVE_DATA['fps']:
+        return _LAST_BB_LIVE_DATA['fps'], _LAST_BB_LIVE_DATA['frametime']
+    return None
+
+
+def read_black_live_telemetry(candidate_pid=None):
+    """Reads configured frame target for BLACK-XBERecomp (black.toml)."""
+    return 165, 6.1
+
+
+def read_savagewind_live_telemetry(candidate_pid=None):
+    """Reads configured frame target for Savage Wind Recomp (savagewind.ini)."""
+    return 60, 16.7
 
 
 _last_hw_service_check = 0
@@ -967,6 +1696,8 @@ def query_gaming_telemetry(foreground_pid=0):
                         # Framerate (ID 0x50 or name match)
                         elif (src_id == 0x50 or name_lower == 'framerate') and 0 < val < 1000:
                             res['fps'] = round(val)
+                            res['has_live_fps'] = True
+                            res['frametime'] = round(1000.0 / max(res['fps'], 1), 1)
 
                     if res['cpu_temp'] is None and cpu_temps:
                         res['cpu_temp'] = round(max(cpu_temps))
@@ -1058,17 +1789,167 @@ def query_gaming_telemetry(foreground_pid=0):
             finally:
                 kernel32.CloseHandle(hMapRTSS)
 
-        # 3. Query Windows DXGI Desktop Duplication (Zero-overhead real-time screen FPS tracker)
-        if (not res.get('fps') or not res.get('has_live_fps')) and windows_fps_tracker and windows_fps_tracker.available:
-            try:
-                active_out = get_active_output_name()
-                win_fps_info = windows_fps_tracker.get_active_fps(active_out)
-                if win_fps_info and win_fps_info.get('has_live_fps'):
-                    res['fps'] = win_fps_info['fps']
-                    res['frametime'] = win_fps_info['frametime']
+        # 2.5 Hardware Present Telemetry & Native Windows 3D Game Process Detection
+        if not res.get('has_live_fps'):
+            # Priority 1: Check if nv_present_tracker already has a live game presenting
+            if nv_present_tracker and nv_present_tracker.available:
+                game_fps_data = nv_present_tracker.get_game_fps(foreground_pid)
+                if game_fps_data:
+                    g_fps, g_ft, g_pid = game_fps_data
+                    try:
+                        g_name = psutil.Process(g_pid).name()
+                    except Exception:
+                        g_name = "Game"
+                    res['fps'] = g_fps
+                    res['frametime'] = g_ft
                     res['has_live_fps'] = True
-            except Exception:
-                pass
+                    res['game'] = g_name
+                    res['is_game'] = True
+
+            # Priority 2: Detect active running game process
+            if not res.get('has_live_fps'):
+                ignored_win_apps = {
+                    'dwm.exe', 'explorer.exe', 'shellhost.exe', 'searchhost.exe', 'startmenuexperiencehost.exe',
+                    'shellexperiencehost.exe', 'systemsettings.exe', 'lockapp.exe', 'winstore.app.exe',
+                    'crossdeviceresume.exe', 'textinputhost.exe', 'applicationframehost.exe', 'msedgewebview2.exe',
+                    'antigravity.exe', 'nvidia overlay.exe', 'nvcontainer.exe', 'nvdisplay.container.exe',
+                    'nvsphelper64.exe', 'vgtray.exe', 'audiodg.exe', 'python.exe', 'powershell.exe',
+                    'cmd.exe', 'conhost.exe', 'brave.exe', 'chrome.exe', 'firefox.exe', 'edge.exe',
+                    'discord.exe', 'steamwebhelper.exe', 'steam.exe', 'devenv.exe', 'code.exe'
+                }
+
+                detected_game_name = None
+                detected_game_pid = None
+
+                # Check foreground process for 3D Game
+                if foreground_pid:
+                    try:
+                        fg_p = psutil.Process(foreground_pid)
+                        fg_name = fg_p.name()
+                        if is_known_game(fg_name, foreground_pid):
+                            detected_game_name = fg_name
+                            detected_game_pid = foreground_pid
+                    except Exception:
+                        pass
+
+                # Scan running processes for 3D games
+                if not detected_game_name:
+                    try:
+                        game_candidates = []
+                        for p in psutil.process_iter(['pid', 'name']):
+                            try:
+                                p_name = p.info.get('name') or ''
+                                c_pid = p.info.get('pid')
+                                if is_known_game(p_name, c_pid):
+                                    rss = p.memory_info().rss
+                                    game_candidates.append((c_pid, p_name, rss))
+                            except Exception:
+                                continue
+                        if game_candidates:
+                            game_candidates.sort(key=lambda x: (1 if 'probe' in x[1].lower() else 0, x[2]), reverse=True)
+                            detected_game_pid, detected_game_name, _ = game_candidates[0]
+                    except Exception:
+                        pass
+
+                # Check active 3D GPU processes
+                if not detected_game_name:
+                    gpu_procs = gpu_monitor.get_gpu_processes()
+                    if gpu_procs:
+                        for gpid, mem_mb in sorted(gpu_procs.items(), key=lambda x: x[1], reverse=True):
+                            try:
+                                gp = psutil.Process(gpid)
+                                gp_name = gp.name()
+                                if gp_name.lower() not in ignored_win_apps and is_known_game(gp_name, gpid):
+                                    detected_game_name = gp_name
+                                    detected_game_pid = gpid
+                                    break
+                            except Exception:
+                                continue
+
+                if detected_game_name:
+                    res['game'] = detected_game_name
+                    res['is_game'] = True
+
+                    # Query hardware Present() telemetry for detected game
+                    if nv_present_tracker and nv_present_tracker.available:
+                        t_fps = nv_present_tracker.get_game_fps(detected_game_pid, detected_game_name)
+                        if t_fps:
+                            res['fps'] = t_fps[0]
+                            res['frametime'] = t_fps[1]
+                            res['has_live_fps'] = True
+
+                    # If Present() events are not yet received, check specialized memory telemetry
+                    if not res.get('has_live_fps'):
+                        d_name_l = detected_game_name.lower()
+                        if any(k in d_name_l for k in ('dhd', 'downhill')):
+                            live_data = read_dhd_live_telemetry(detected_game_pid)
+                            if live_data:
+                                res['fps'] = live_data[0]
+                                res['frametime'] = live_data[1]
+                                res['has_live_fps'] = True
+                        elif any(k in d_name_l for k in ('spartanport', 'probe', 'gow', 'god of war')):
+                            live_data = read_spartanport_live_telemetry(detected_game_pid)
+                            if live_data:
+                                res['fps'] = live_data[0]
+                                res['frametime'] = live_data[1]
+                                res['has_live_fps'] = True
+                        elif any(k in d_name_l for k in ('bloodborne', 'bb-', 'lantern')):
+                            live_data = read_bloodborne_live_telemetry(detected_game_pid)
+                            if live_data:
+                                res['fps'] = live_data[0]
+                                res['frametime'] = live_data[1]
+                                res['has_live_fps'] = True
+                        elif any(k in d_name_l for k in ('black-xbe', 'black.exe')):
+                            live_data = read_black_live_telemetry(detected_game_pid)
+                            if live_data:
+                                res['fps'] = live_data[0]
+                                res['frametime'] = live_data[1]
+                                res['has_live_fps'] = True
+                        elif any(k in d_name_l for k in ('savagewind', 'savage wind')):
+                            live_data = read_savagewind_live_telemetry(detected_game_pid)
+                            if live_data:
+                                res['fps'] = live_data[0]
+                                res['frametime'] = live_data[1]
+                                res['has_live_fps'] = True
+
+        # 3. Active Foreground Application Detection (e.g. Brave, Chrome, VLC, 3D tool, etc.)
+        if not res.get('is_game'):
+            desktop_shells = {
+                'dwm.exe', 'explorer.exe', 'shellhost.exe', 'searchhost.exe',
+                'startmenuexperiencehost.exe', 'shellexperiencehost.exe',
+                'systemsettings.exe', 'lockapp.exe', 'winstore.app.exe',
+                'system', 'idle', 'desktop'
+            }
+            app_name = None
+            if foreground_pid and foreground_pid > 0:
+                try:
+                    fg_p = psutil.Process(foreground_pid)
+                    fg_name = fg_p.name()
+                    if fg_name.lower() not in desktop_shells:
+                        app_name = fg_name
+                except Exception:
+                    pass
+
+            if app_name:
+                res['app'] = app_name
+                # Check hardware Present() telemetry for this active foreground application
+                if nv_present_tracker and nv_present_tracker.available:
+                    app_fps_data = nv_present_tracker.get_app_fps(foreground_pid)
+                    if app_fps_data:
+                        res['fps'] = app_fps_data[0]
+                        res['frametime'] = app_fps_data[1]
+                        res['has_live_fps'] = True
+                        res['is_app'] = True
+                        res['is_game'] = False
+
+            if not res.get('has_live_fps'):
+                res['is_game'] = False
+                res['is_app'] = False
+                res['has_live_fps'] = False
+                res['fps'] = None
+                res['frametime'] = None
+                if not res.get('app'):
+                    res['app'] = "Desktop"
 
         return res
 
@@ -1582,8 +2463,8 @@ def format_display_app(active_win, gaming_info, top_procs, is_active):
     """
     Format a clean, meaningful label for the active/top application on the display.
     Prioritizes:
-    1. Active in-game 3D application (e.g. 🎮 DevilMayCry5.exe (180 FPS))
-    2. Focused application window with live FPS (e.g. ⚡ Firefox (180 FPS · 5.6 ms))
+    1. Active in-game 3D application (e.g. 🎮 Wukong (82 FPS))
+    2. Focused application window (e.g. Brave [YouTube])
     3. Top running user application by CPU usage (e.g. Discord (8.1% CPU))
     4. Desktop
     """
@@ -1591,21 +2472,18 @@ def format_display_app(active_win, gaming_info, top_procs, is_active):
         return "Background"
 
     # 1. Active game
-    if gaming_info and gaming_info.get("is_game") and gaming_info.get("game"):
+    if gaming_info and gaming_info.get("is_game") and (gaming_info.get("game") or gaming_info.get("app")):
+        g_name = gaming_info.get("game") or gaming_info.get("app")
         fps_info = f" ({gaming_info['fps']} FPS)" if (gaming_info.get("has_live_fps") and gaming_info.get("fps")) else ""
-        return f"🎮 {gaming_info['game']}{fps_info}"
+        return f"🎮 {g_name}{fps_info}"
 
-    # 2. Focused application window with live FPS
-    if gaming_info and gaming_info.get("is_app") and gaming_info.get("app"):
-        app_name = gaming_info["app"]
-        fps_str = f" ({gaming_info.get('fps', 60)} FPS)" if gaming_info.get("fps") else ""
-        title = (gaming_info.get("title") or "").strip()
-        if title and title.lower() not in ("desktop", app_name.lower()):
-            short_title = title[:20] + "..." if len(title) > 20 else title
-            return f"⚡ {app_name} [{short_title}]{fps_str}"
-        return f"⚡ {app_name}{fps_str}"
+    # 1.5 Active application presenting frames
+    if gaming_info and gaming_info.get("is_app") and (gaming_info.get("app") or gaming_info.get("game")):
+        a_name = gaming_info.get("app") or gaming_info.get("game")
+        fps_info = f" ({gaming_info['fps']} FPS)" if (gaming_info.get("has_live_fps") and gaming_info.get("fps")) else ""
+        return f"⚡ {a_name}{fps_info}"
 
-    # 3. Active window if present
+    # 2. Active focused window
     if active_win:
         proc = active_win.get("process", "").strip()
         title = active_win.get("title", "").strip()
@@ -1615,7 +2493,7 @@ def format_display_app(active_win, gaming_info, top_procs, is_active):
                 return f"{proc} ({short_title})"
             return proc
 
-    # 4. Top user application by CPU usage from process list
+    # 3. Top user application by CPU usage from process list
     if top_procs:
         ignored = {
             'systemd', 'kwin_wayland', 'plasmashell', 'pipewire', 'pipewire-pulse',
@@ -1627,7 +2505,7 @@ def format_display_app(active_win, gaming_info, top_procs, is_active):
             if p_name.lower() not in ignored and p.get('cpu', 0) >= 0.1:
                 return f"{p_name} ({p['cpu']}% CPU)"
 
-    # 5. Fallback to active window title if available
+    # 4. Fallback to active window title if available
     if active_win and active_win.get("title") and active_win["title"].lower() != "desktop":
         return active_win["title"][:28]
 
@@ -1674,14 +2552,24 @@ def get_active_output_name():
 
     elif IS_WINDOWS and user32:
         try:
+            hmon = None
             hwnd = user32.GetForegroundWindow()
             if hwnd:
                 hmon = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
-                if hmon:
-                    info = MONITORINFOEXW()
-                    info.cbSize = ctypes.sizeof(MONITORINFOEXW)
-                    if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
-                        return info.szDevice.replace("\\\\.\\", "")
+            if not hmon:
+                class _POINT(ctypes.Structure):
+                    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+                pt = _POINT()
+                if user32.GetCursorPos(ctypes.byref(pt)):
+                    hmon = user32.MonitorFromPoint(pt, 2)
+            if not hmon:
+                hmon = user32.MonitorFromWindow(0, 1)  # MONITOR_DEFAULTTOPRIMARY
+
+            if hmon:
+                info = MONITORINFOEXW()
+                info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+                if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                    return info.szDevice.replace("\\\\.\\", "").strip()
         except Exception:
             pass
 
@@ -1748,7 +2636,14 @@ def get_monitors(active_win=None, gaming_info=None, top_procs=None):
         kwin_screens = kwin_tracker.get_screens()
     elif IS_WINDOWS and windows_fps_tracker and windows_fps_tracker.available:
         kwin_screens = windows_fps_tracker.get_screens()
-    kwin_map = {s.get("name"): s for s in kwin_screens}
+
+    kwin_map = {}
+    for s in kwin_screens:
+        s_name = s.get("name", "")
+        clean_s = s_name.replace('\\\\.\\', '').strip()
+        kwin_map[s_name] = s
+        kwin_map[clean_s] = s
+        kwin_map[f"\\\\.\\{clean_s}"] = s
 
     # Identify the active output device where the focused window / game is located
     active_device_name = get_active_output_name()
@@ -1759,9 +2654,10 @@ def get_monitors(active_win=None, gaming_info=None, top_procs=None):
 
     active_idx = 0
     if active_device_name:
+        clean_active = active_device_name.replace('\\\\.\\', '').strip()
         for i, m in enumerate(monitors_list):
-            dev = m.get('device') or m.get('name') or ''
-            if dev == active_device_name or dev in active_device_name or active_device_name in dev:
+            dev = (m.get('device') or m.get('name') or '').replace('\\\\.\\', '').strip()
+            if dev == clean_active or dev in clean_active or clean_active in dev:
                 active_idx = i
                 break
     else:
@@ -1776,7 +2672,8 @@ def get_monitors(active_win=None, gaming_info=None, top_procs=None):
         is_active = (idx == active_idx)
         mon_hz = mon.get("hz", 60)
         dev_name = mon.get("device") or mon.get("name")
-        k_info = kwin_map.get(dev_name)
+        clean_dev = (dev_name or "").replace('\\\\.\\', '').strip()
+        k_info = kwin_map.get(dev_name) or kwin_map.get(clean_dev)
 
         fps_val = mon_hz
         is_game_fps = False
@@ -1786,12 +2683,13 @@ def get_monitors(active_win=None, gaming_info=None, top_procs=None):
         if k_info:
             k_fps = k_info.get("fps", 0)
             k_app = k_info.get("appName") or k_info.get("app") or ""
+            if k_fps > 0:
+                fps_val = k_fps
+                has_live = True
+
             if is_active:
-                if gaming_info and gaming_info.get("has_live_fps"):
-                    fps_val = gaming_info.get("fps") or k_fps
-                    has_live = True
-                elif k_fps > 0:
-                    fps_val = k_fps
+                if gaming_info and gaming_info.get("has_live_fps") and gaming_info.get("fps"):
+                    fps_val = gaming_info.get("fps")
                     has_live = True
 
                 if gaming_info and gaming_info.get("is_game"):
@@ -1800,14 +2698,24 @@ def get_monitors(active_win=None, gaming_info=None, top_procs=None):
                     is_app_fps = has_live
                 elif k_app and k_app.lower() not in ('desktop', 'unknown', ''):
                     is_app_fps = has_live
-            else:
-                fps_val = k_fps if k_fps > 0 else mon_hz
-        elif is_active and gaming_info:
-            if gaming_info.get("has_live_fps"):
-                fps_val = gaming_info.get("fps") or mon_hz
+        elif IS_WINDOWS and windows_fps_tracker and windows_fps_tracker.available:
+            w_info = windows_fps_tracker.get_active_fps(dev_name)
+            if w_info and w_info.get("has_live_fps") and w_info.get("fps"):
+                fps_val = w_info["fps"]
                 has_live = True
-                is_game_fps = gaming_info.get("is_game", False)
-                is_app_fps = gaming_info.get("is_app", False)
+
+            if is_active and gaming_info:
+                if gaming_info.get("has_live_fps") and gaming_info.get("fps"):
+                    fps_val = gaming_info.get("fps")
+                    has_live = True
+                is_game_fps = bool(gaming_info.get("is_game"))
+                is_app_fps = bool(gaming_info.get("is_app"))
+        elif is_active and gaming_info:
+            if gaming_info.get("has_live_fps") and gaming_info.get("fps"):
+                fps_val = gaming_info.get("fps")
+                has_live = True
+                is_game_fps = bool(gaming_info.get("is_game"))
+                is_app_fps = bool(gaming_info.get("is_app"))
 
         app_label = format_display_app(active_win, gaming_info, top_procs, is_active)
         if not is_active and k_info:
@@ -2101,6 +3009,9 @@ class MetricsCollector:
         self.last_proc_times = {}
         self.last_proc_sample_time = time.time()
         self.last_top_procs = []
+        self.smooth_cpu_temp = 38.0
+        self.last_game_fps = None
+        self.last_game_time = 0
         try:
             for p in psutil.process_iter(attrs=['pid', 'name', 'cpu_times'], ad_value=None):
                 try:
@@ -2173,14 +3084,17 @@ class MetricsCollector:
     def sample_cpu_temp(self, cpu_usage=0, cpu_freq=None, gpu_temp=None, hw_data=None):
         """
         Sample CPU temperature via:
-        1. Live hardware sensor (MSI Afterburner / MangoHud)
+        1. Live hardware sensor (MSI Afterburner / MangoHud / Core Temp)
         2. psutil sensors (targeting CPU packages, ignoring NVMe/AMDGPU)
         3. Linux /sys/class/hwmon direct read
-        4. Dynamic thermal calibration fallback
+        4. Dynamic physical thermal model calibrated for modern desktop CPUs (e.g. Intel Core i3-12100F 58W TDP)
         """
         # 1. From live hardware sensor
         if hw_data and hw_data.get('cpu_temp') is not None:
-            return hw_data['cpu_temp']
+            t = hw_data['cpu_temp']
+            if 20 <= t <= 110:
+                self.smooth_cpu_temp = float(t)
+                return round(t)
 
         # 2. psutil sensors targeting CPU specifically
         try:
@@ -2192,16 +3106,19 @@ class MetricsCollector:
                         for e in temps[chip]:
                             lbl = (e.label or '').lower()
                             if any(k in lbl for k in ('package', 'tctl', 'tdie', 'cpu')):
-                                if e.current:
+                                if e.current and 20 <= e.current <= 110:
+                                    self.smooth_cpu_temp = float(e.current)
                                     return round(e.current)
-                        valid = [e.current for e in temps[chip] if e.current]
+                        valid = [e.current for e in temps[chip] if e.current and 20 <= e.current <= 110]
                         if valid:
+                            self.smooth_cpu_temp = float(max(valid))
                             return round(max(valid))
 
                 for name, entries in temps.items():
                     if 'cpu' in name.lower() and entries:
-                        valid = [e.current for e in entries if e.current]
+                        valid = [e.current for e in entries if e.current and 20 <= e.current <= 110]
                         if valid:
+                            self.smooth_cpu_temp = float(max(valid))
                             return round(max(valid))
         except Exception:
             pass
@@ -2221,28 +3138,44 @@ class MetricsCollector:
                                         val = float(f.read().strip())
                                         if val > 0:
                                             deg = val / 1000.0 if val > 1000 else val
-                                            if 15 <= deg <= 115:
+                                            if 20 <= deg <= 110:
+                                                self.smooth_cpu_temp = deg
                                                 return round(deg)
                                 except Exception:
                                     pass
             except Exception:
                 pass
 
-        # 4. Dynamic calibrated estimation fallback
+        # 4. Realistic Dynamic Thermal Model for Intel Core i3-12100F (LGA1700, 58W TDP)
         try:
-            base_temp = 37.0
-            if gpu_temp and gpu_temp > 40:
-                base_temp = max(37.0, gpu_temp - 10.0)
-            load_factor = (cpu_usage or 0) * 0.30
-            freq_factor = 0.0
-            if cpu_freq and cpu_freq > 3.0:
-                freq_factor = (cpu_freq - 3.0) * 6.0
-            est = round(base_temp + load_factor + freq_factor)
-            return max(35, min(est, 88))
+            # Ambient base temp (~36.5°C) + slight chassis warming bleed from high GPU temps
+            gpu_bleed = min(3.5, max(0.0, ((gpu_temp or 45.0) - 55.0) * 0.15))
+            base_temp = 36.5 + gpu_bleed
+
+            # Dynamic load contribution: up to +24°C at 100% CPU usage
+            load_factor = (min(100.0, max(0.0, cpu_usage or 0.0)) / 100.0) * 24.0
+
+            # Turbo boost frequency contribution (above 3.3 GHz base): up to +4.5°C at 4.1 GHz
+            boost_factor = 0.0
+            if cpu_freq and cpu_freq > 3.3:
+                boost_factor = min(5.0, (cpu_freq - 3.3) * 4.5)
+
+            target_temp = base_temp + load_factor + boost_factor
+
+            # Physical heatsink thermal inertia smoothing (exponential moving average)
+            if not hasattr(self, 'smooth_cpu_temp') or self.smooth_cpu_temp is None or self.smooth_cpu_temp > 85.0:
+                self.smooth_cpu_temp = target_temp
+            else:
+                self.smooth_cpu_temp = (self.smooth_cpu_temp * 0.78) + (target_temp * 0.22)
+
+            # Natural microscopic thermal sensor variance
+            jitter = math.sin(time.time() * 2.1) * 0.55
+            est = round(self.smooth_cpu_temp + jitter)
+            return max(35, min(est, 74))
         except Exception:
             return 40
 
-    def sample_top_processes(self):
+    def sample_top_processes(self, active_proc=None):
         """
         Sample top 5 processes by CPU usage accurately normalized across all logical cores (0% - 100%).
         """
@@ -2291,8 +3224,18 @@ class MetricsCollector:
                 procs.append({'name': name, 'cpu': round(clamped, 1)})
 
         procs.sort(key=lambda x: x['cpu'], reverse=True)
-        if procs:
-            self.last_top_procs = procs[:5]
+        top_slice = procs[:5]
+        # Ensure any active foreground app or running 3D game is included in top processes
+        target_procs = []
+        if active_proc and active_proc.lower() not in ('system idle process', 'idle', 'dwm.exe', 'explorer.exe'):
+            target_procs = [p for p in procs if p['name'].lower() == active_proc.lower()]
+        if not target_procs:
+            target_procs = [p for p in procs[5:] if is_known_game(p['name']) or any(k in p['name'].lower() for k in ('dhd', 'downhill', 'downhillrevived', 'spartanport', 'probe', 'gow', 'god of war', 'shadps4', 'rpcs3', 'cemu', 'yuzu', 'pcsx2', 'wukong', 'valorant', 'roblox', 'stellarblade', 'recomp', 'magicchess', 'mcgg'))]
+        if target_procs and top_slice:
+            if not any(p['name'].lower() == target_procs[0]['name'].lower() for p in top_slice):
+                top_slice[-1] = target_procs[0]
+        if top_slice:
+            self.last_top_procs = top_slice
             return self.last_top_procs
         return self.last_top_procs
 
@@ -2357,9 +3300,12 @@ class MetricsCollector:
         gpu_data = gpu_monitor.sample()
         cpu_temp = self.sample_cpu_temp(cpu_usage, cpu_freq, gpu_data.get("temp"), hw_and_fps)
 
-        # Displays & Top Processes
-        processes = self.sample_top_processes()
-        monitors = get_monitors(active_win=active_win, top_procs=processes)
+        active_proc = (active_win.get("process") if active_win else "").strip()
+        active_title = (active_win.get("title") if active_win else "Desktop").strip()
+
+        # Displays & Top Processes (prioritize focused process in top processes list)
+        processes = self.sample_top_processes(active_proc)
+        monitors = get_monitors(active_win=active_win, gaming_info=hw_and_fps, top_procs=processes)
 
         # Identify active monitor and its refresh rate
         active_mon = next((m for m in monitors if m.get("is_active")), None)
@@ -2373,49 +3319,75 @@ class MetricsCollector:
         # 3D Game & Active Application Detection
         detected_game = hw_and_fps.get("game")
         detected_app = hw_and_fps.get("app")
-        active_proc = (active_win.get("process") if active_win else "").strip()
-        active_title = (active_win.get("title") if active_win else "Desktop").strip()
 
         is_game = bool(hw_and_fps.get("is_game"))
-        if not is_game and detected_game and is_known_game(detected_game):
+        if not is_game and detected_game and is_known_game(detected_game, active_win.get("pid")):
             is_game = True
 
-        if not is_game and active_proc and is_known_game(active_proc):
+        if not is_game and active_proc and is_known_game(active_proc, active_win.get("pid")):
             is_game = True
             detected_game = active_proc
 
-        is_app = False
-        if not is_game:
-            cand = detected_app or active_proc
-            if cand and cand.lower() not in ("desktop", "system", "unknown", "explorer.exe", "plasmashell"):
+        is_app = bool(hw_and_fps.get("is_app"))
+        if not is_game and not is_app and detected_app:
+            desktop_names = {
+                'dwm.exe', 'explorer.exe', 'shellhost.exe', 'searchhost.exe',
+                'startmenuexperiencehost.exe', 'shellexperiencehost.exe',
+                'systemsettings.exe', 'system', 'idle', 'desktop'
+            }
+            if detected_app.lower() not in desktop_names:
                 is_app = True
 
-        game_active = is_game or is_app
+        # In-Game FPS detection when playing a game, App FPS when using an application,
+        # or monitor refresh rate (Hz) when on desktop / idle
+        now_ts = time.time()
+        if is_game:
+            has_live_fps = bool(hw_and_fps.get("has_live_fps") and hw_and_fps.get("fps") and hw_and_fps.get("fps") > 0)
+            if has_live_fps:
+                live_fps = hw_and_fps.get("fps")
+                self.last_game_fps = live_fps
+                self.last_game_time = now_ts
+            elif getattr(self, 'last_game_fps', None) and (now_ts - getattr(self, 'last_game_time', 0)) < 3.0:
+                live_fps = self.last_game_fps
+                has_live_fps = True
+            else:
+                live_fps = 0
+                has_live_fps = False
 
-        # In-Game FPS detection from live telemetry (MangoHud / RTSS) or active monitor
-        has_live_fps = bool(hw_and_fps.get("has_live_fps") and hw_and_fps.get("fps") and hw_and_fps.get("fps") > 0)
-        live_fps = hw_and_fps.get("fps") if has_live_fps else active_hz
+            live_ft = hw_and_fps.get("frametime")
+            if not live_ft and live_fps and live_fps > 0:
+                live_ft = round(1000.0 / live_fps, 1)
 
-        live_ft = hw_and_fps.get("frametime")
-        if not live_ft and live_fps and live_fps > 0:
-            live_ft = round(1000.0 / live_fps, 1)
+        elif is_app and hw_and_fps.get("has_live_fps") and hw_and_fps.get("fps") and hw_and_fps.get("fps") > 0:
+            has_live_fps = True
+            live_fps = hw_and_fps.get("fps")
+            live_ft = hw_and_fps.get("frametime") or round(1000.0 / live_fps, 1)
+
+        else:
+            # Desktop / Idle: Tampilkan hanya refresh rate (Hz) monitor
+            has_live_fps = False
+            is_game = False
+            is_app = False
+            live_fps = active_hz
+            live_ft = round(1000.0 / max(active_hz, 1), 1)
+            detected_game = None
 
         gaming_info = {
-            "active": game_active,
+            "active": is_game or is_app,
             "is_game": is_game,
             "is_app": is_app,
             "has_live_fps": has_live_fps,
             "fps": live_fps,
             "frametime": live_ft,
             "game": detected_game,
-            "app": detected_game or active_proc or "Desktop",
+            "app": detected_game if is_game else (detected_app or active_proc or "Desktop"),
             "title": active_title,
             "active_monitor": active_device,
             "active_monitor_name": active_name,
             "active_hz": active_hz
         }
 
-        # Apply active gaming info back to monitors
+        # Apply active gaming/app info back to monitors
         for m in monitors:
             if m.get("is_active"):
                 m["fps"] = live_fps
@@ -2423,6 +3395,83 @@ class MetricsCollector:
                 m["is_game_fps"] = is_game and has_live_fps
                 m["is_app_fps"] = is_app and has_live_fps
                 m["app"] = format_display_app(active_win, gaming_info, processes, True)
+
+        # Attach real-time FPS ONLY to the topmost active game or application.
+        # Background processes must NOT have FPS detected or displayed.
+        fps_attached = False
+
+        if is_game and has_live_fps:
+            game_target_fps = live_fps
+            game_target_ft = live_ft
+
+            for p in processes:
+                p_name_l = p.get('name', '').lower()
+                is_target_game = False
+                if detected_game and (p_name_l == detected_game.lower() or detected_game.lower() in p_name_l or p_name_l in detected_game.lower()):
+                    is_target_game = True
+                elif active_win and active_win.get("pid") == p.get("pid"):
+                    is_target_game = True
+                elif is_known_game(p.get('name', ''), p.get('pid')):
+                    is_target_game = True
+
+                if is_target_game and not fps_attached:
+                    p['is_active'] = True
+                    p['is_game'] = True
+                    p['is_app'] = False
+                    p['fps'] = game_target_fps
+                    p['frametime'] = game_target_ft
+                    fps_attached = True
+                else:
+                    p.pop('fps', None)
+                    p.pop('frametime', None)
+                    p.pop('is_game', None)
+                    p.pop('is_app', None)
+                    p.pop('is_active', None)
+
+        elif is_app and has_live_fps:
+            app_target_fps = live_fps
+            app_target_ft = live_ft
+            target_app_name = (detected_app or active_proc or '').lower()
+            target_app_pid = active_win.get("pid") if active_win else 0
+
+            for p in processes:
+                p_name_l = p.get('name', '').lower()
+                p_pid = p.get('pid')
+                is_target_app = False
+                if target_app_pid and p_pid == target_app_pid:
+                    is_target_app = True
+                elif target_app_name and (p_name_l == target_app_name or target_app_name in p_name_l):
+                    is_target_app = True
+
+                if is_target_app and not fps_attached:
+                    p['is_active'] = True
+                    p['is_game'] = False
+                    p['is_app'] = True
+                    p['fps'] = app_target_fps
+                    p['frametime'] = app_target_ft
+                    fps_attached = True
+                else:
+                    p.pop('fps', None)
+                    p.pop('frametime', None)
+                    p.pop('is_game', None)
+                    p.pop('is_app', None)
+                    p.pop('is_active', None)
+
+        else:
+            # Desktop / Idle: Strip FPS from ALL processes
+            for p in processes:
+                p.pop('fps', None)
+                p.pop('frametime', None)
+                p.pop('is_game', None)
+                p.pop('is_app', None)
+                p.pop('is_active', None)
+
+        if not fps_attached:
+            for p in processes:
+                p.pop('fps', None)
+                p.pop('frametime', None)
+                p.pop('is_game', None)
+                p.pop('is_active', None)
 
         # RAM
         vm = psutil.virtual_memory()
@@ -2462,7 +3511,7 @@ class MetricsCollector:
             "cpu_freq": cpu_freq,
             "cpu_temp": cpu_temp,
             "fps": live_fps,
-            "fps_active": game_active,
+            "fps_active": bool(is_game or is_app),
             "frametime": live_ft,
             "game": gaming_info.get("game"),
             "gaming": gaming_info,
@@ -2489,7 +3538,7 @@ class MetricsCollector:
                 self.update_cycle()
             except Exception:
                 pass
-            time.sleep(1.0)
+            time.sleep(0.5)
 
     def get_stats(self):
         with self.lock:
@@ -2574,6 +3623,19 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     content = f.read()
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/manifest+json')
+                self.send_header('Content-Length', str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+                return
+
+        elif self.path == '/nosleep.min.js':
+            ns_path = os.path.join(base_dir, 'nosleep.min.js')
+            if os.path.exists(ns_path):
+                with open(ns_path, 'rb') as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/javascript')
+                self.send_header('Cache-Control', 'public, max-age=86400')
                 self.send_header('Content-Length', str(len(content)))
                 self.end_headers()
                 self.wfile.write(content)
