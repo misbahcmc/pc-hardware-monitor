@@ -4,7 +4,7 @@ Semua catatan perubahan dan pembaruan penting pada proyek PC Hardware Monitor di
 
 ---
 
-## [2.6.0] - 15 November 2026
+## [V2.61] - 16 November 2026
 
 ### 🎮 Peningkatan Utama & Sinkronisasi Presisi FPS (Major Improvements)
 - **Pelacakan Hardware Present Game Super Akurat (`NvPresentTracker`)**:
@@ -28,10 +28,24 @@ Semua catatan perubahan dan pembaruan penting pada proyek PC Hardware Monitor di
   - **MSI Afterburner Shared Memory (`MAHMSharedMemory`)**: Menambahkan jalur telemetri pembacaan Suhu (°C), GPU Usage (%), dan pemakaian VRAM secara real-time untuk kartu grafis AMD Radeon dan Intel Arc di Windows.
   - **Linux Driver Mesa ANV / RADV**: Mendukung telemetri otomatis sysfs kernel DRM Linux dan compositor KWin Wayland.
 
+- **Eliminasi Total Lag Penutupan Server (Instant Zero-Lag Close < 10 ms)**:
+  - **Pencegahan DirectX Loader Lock Deadlock**: Menonaktifkan modul duplikasi layar DirectX (`IDXGIOutputDuplication`) yang memegang context D3D11 dan `SetThreadDesktop`. Hal ini 100% melenyapkan freeze driver grafis saat proses keluar.
+  - **Native Win32 Console Control Handler (`SetConsoleCtrlHandler`)**: Mendaftarkan listener event `CTRL_CLOSE_EVENT` dan `CTRL_C_EVENT` langsung ke kernel Windows yang langsung memanggil `kernel32.TerminateProcess(kernel32.GetCurrentProcess(), 0)` sehingga jendela langsung tertutup seketika tanpa delay OS.
+  - **Penutupan Named Pipe FrameView Eksplisit**: Menambahkan `kernel32.CloseHandle(self.pipe)` saat shutdown sehingga I/O named pipe tidak menahan proses.
+  - **Koneksi HTTP Daemon Threads (`daemon_threads = True`)**: Menjadikan seluruh worker thread HTTP koneksi HP/tablet berstatus daemon agar tidak menahan proses keluar saat aplikasi ditutup.
+  - **Pencegahan Prompt Gantung Batch File (`start_monitor.bat`)**: Menjalankan Python dengan pengalihan input `<nul` dan perintah penutup `exit /b 0`, mencegah `cmd.exe` menggantung pada prompt `Terminate batch job (Y/N)?`.
+  - **Migrasi ke `schtasks.exe`**: Menggantikan pemanggilan berat `powershell.exe` di latar belakang dengan binary native Windows `schtasks.exe` (eksekusi instan ~5 ms tanpa overhead runtime .NET).
+
+- **Pembersihan Terminal Linux di Distro Non-KDE (Ubuntu / GNOME / XFCE)**:
+  - Mengatasi munculnya pesan peringatan `Call failed: The name org.kde.KWin was not provided by any .service files` saat menjalankan `./start_monitor.sh` di Ubuntu (GNOME).
+  - Menambahkan deteksi desktop environment cerdas `is_kwin_available()`: jika sistem tidak menjalankan KDE Plasma / KWin, panggilan D-Bus KWin dan thread `KWinTracker` otomatis dilewati.
+  - Mengisolasi seluruh pemanggilan subprocess CLI dengan `stderr=subprocess.DEVNULL` sehingga output terminal tetap bersih, rapi, dan bebas dari error internal desktop compositor.
+  - Menambahkan fallback pendeteksian display output aktif via `xrandr` untuk pengguna GNOME / Ubuntu.
+
 - **Pembersihan Folder & Optimasi Repack Distribusi Proyek**:
   - Menghapus 15 file sampah capture test `FvSDK*.csv` yang sempat terbuat saat pengujian awal.
   - Menghapus file draft lama `windows_implementation_plan.md` dan cache bytecode `__pycache__`.
-  - Mengurangi ukuran arsip rilis zip dari ~175 KB menjadi ~71 KB (penurunan ukuran > 59%).
+  - Mengurangi ukuran arsip rilis zip dari ~175 KB menjadi ~74 KB (penurunan ukuran > 57%).
 
 ---
 

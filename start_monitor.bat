@@ -39,14 +39,9 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 :: 2.5 Jalankan background service hardware sensor (MSI Afterburner) jika tersedia untuk sensor suhu CPU real-time
-powershell -Command "Start-ScheduledTask -TaskName 'MSIAfterburner' -ErrorAction SilentlyContinue" >nul 2>nul
+schtasks /run /tn "MSIAfterburner" >nul 2>nul
 
 :: 3. Jalankan server pemantauan
 echo [*] Memulai server...
-"%PY_CMD%" app.py
-
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo [!] Server berhenti karena kendala.
-    pause
-)
+"%PY_CMD%" app.py <nul
+exit /b 0

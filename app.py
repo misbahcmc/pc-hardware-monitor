@@ -61,6 +61,23 @@ if IS_WINDOWS:
     kernel32 = ctypes.windll.kernel32
     gdi32 = ctypes.windll.gdi32
 
+    # Fast Windows console close handler (instant shutdown on Close 'X' button or Ctrl+C)
+    _win_ctrl_handler_ref = None
+    try:
+        _PHANDLER = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+        def _fast_console_ctrl_handler(ctrl_type):
+            try:
+                if 'nv_present_tracker' in globals() and nv_present_tracker and hasattr(nv_present_tracker, 'fn_stop') and nv_present_tracker.session:
+                    nv_present_tracker.fn_stop(nv_present_tracker.session)
+            except Exception:
+                pass
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), 0)
+            return True
+        _win_ctrl_handler_ref = _PHANDLER(_fast_console_ctrl_handler)
+        kernel32.SetConsoleCtrlHandler(_win_ctrl_handler_ref, True)
+    except Exception:
+        pass
+
     FILE_MAP_READ = 0x0004
     kernel32.OpenFileMappingW.restype = wintypes.HANDLE
     kernel32.MapViewOfFile.restype = ctypes.c_void_p
@@ -201,7 +218,7 @@ class GpuTelemetry:
             try:
                 out = subprocess.check_output(
                     ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader,nounits'],
-                    text=True, timeout=2
+                    text=True, timeout=2, stderr=subprocess.DEVNULL
                 ).strip()
                 if out:
                     self.gpu_name = out.splitlines()[0].strip()
@@ -343,7 +360,7 @@ class GpuTelemetry:
             try:
                 out = subprocess.check_output(
                     ['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'],
-                    text=True, timeout=1.0
+                    text=True, timeout=1.0, stderr=subprocess.DEVNULL
                 )
                 for line in out.splitlines():
                     parts = [x.strip() for x in line.split(',') if x.strip()]
@@ -420,7 +437,7 @@ class GpuTelemetry:
                 out = subprocess.check_output(
                     ['nvidia-smi', '--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total',
                      '--format=csv,noheader,nounits'],
-                    text=True, timeout=1.5
+                    text=True, timeout=1.5, stderr=subprocess.DEVNULL
                 ).strip()
                 if out:
                     parts = [p.strip() for p in out.splitlines()[0].split(',')]
@@ -520,8 +537,18 @@ gpu_monitor = GpuTelemetry()
 
 
 # ---------------------------------------------------------------------------
-# KWin Compositor Window Damage & Real-Time FPS Tracker (Linux Wayland)
+# KWin Compositor Window Damage & Real-Time FPS Tracker (Linux Wayland / KDE)
 # ---------------------------------------------------------------------------
+def is_kwin_available():
+    """Check if the system is running under KDE Plasma / KWin compositor."""
+    if not IS_LINUX:
+        return False
+    desktop = (os.environ.get('XDG_CURRENT_DESKTOP', '') + ' ' +
+               os.environ.get('DESKTOP_SESSION', '') + ' ' +
+               os.environ.get('KDE_FULL_SESSION', '')).lower()
+    return 'kde' in desktop or 'plasma' in desktop
+
+
 class KWinTracker(threading.Thread):
     """
     Tracks per-monitor window damage events directly from the KWin Wayland compositor.
@@ -538,7 +565,7 @@ class KWinTracker(threading.Thread):
         self.script_file = '/tmp/viewhp_kwin_tracker_v210.js'
 
     def run(self):
-        if not IS_LINUX:
+        if not IS_LINUX or not is_kwin_available():
             return
         try:
             import dbus
@@ -650,7 +677,7 @@ class KWinTracker(threading.Thread):
 
 
 kwin_tracker = KWinTracker()
-if IS_LINUX:
+if IS_LINUX and is_kwin_available():
     kwin_tracker.start()
     atexit.register(kwin_tracker.cleanup)
 
@@ -994,10 +1021,7 @@ class WindowsFpsTracker(threading.Thread):
                 w.running = False
 
 
-windows_fps_tracker = WindowsFpsTracker()
-if IS_WINDOWS:
-    windows_fps_tracker.start()
-    atexit.register(windows_fps_tracker.cleanup)
+windows_fps_tracker = None
 
 
 class NvPresentTracker:
@@ -1225,11 +1249,12 @@ class NvPresentTracker:
     def cleanup(self):
         self.running = False
         try:
+            if hasattr(self, 'pipe') and self.pipe and self.pipe.value and kernel32:
+                kernel32.CloseHandle(self.pipe)
+                self.pipe = ctypes.c_void_p(0)
             if self.session and self.session.value:
                 if hasattr(self, 'fn_stop'):
                     self.fn_stop(self.session)
-                if hasattr(self, 'fn_destroy'):
-                    self.fn_destroy(self.session)
         except Exception:
             pass
 
@@ -1634,9 +1659,11 @@ def ensure_hardware_monitor_service():
         kernel32.CloseHandle(hMap)
         return
     try:
+        CREATE_NO_WINDOW = 0x08000000
         subprocess.Popen(
-            ['powershell', '-Command', 'Start-ScheduledTask -TaskName "MSIAfterburner" -ErrorAction SilentlyContinue'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ['schtasks', '/run', '/tn', 'MSIAfterburner'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW
         )
     except Exception:
         pass
@@ -2516,16 +2543,17 @@ def get_active_output_name():
     """Detect the name of the currently active/focused display output."""
     if IS_LINUX:
         # 1. KDE Plasma: activeOutputName D-Bus call
-        try:
-            out = subprocess.check_output(
-                ['busctl', '--user', 'call', 'org.kde.KWin', '/KWin', 'org.kde.KWin', 'activeOutputName'],
-                text=True, timeout=0.5
-            )
-            m = re.search(r's\s+\"([^\"]+)\"', out)
-            if m and m.group(1).strip():
-                return m.group(1).strip()
-        except Exception:
-            pass
+        if is_kwin_available():
+            try:
+                out = subprocess.check_output(
+                    ['busctl', '--user', 'call', 'org.kde.KWin', '/KWin', 'org.kde.KWin', 'activeOutputName'],
+                    text=True, timeout=0.5, stderr=subprocess.DEVNULL
+                )
+                m = re.search(r's\s+\"([^\"]+)\"', out)
+                if m and m.group(1).strip():
+                    return m.group(1).strip()
+            except Exception:
+                pass
 
         # 2. Hyprland: activeworkspace monitor
         if shutil.which('hyprctl'):
@@ -2547,6 +2575,20 @@ def get_active_output_name():
                     for o in outputs:
                         if o.get('focused'):
                             return o.get('name')
+            except Exception:
+                pass
+
+        # 4. GNOME / X11 / Xwayland fallback: xrandr primary or connected output
+        if shutil.which('xrandr'):
+            try:
+                res = subprocess.run(['xrandr', '--current'], capture_output=True, text=True, timeout=0.5)
+                if res.returncode == 0 and res.stdout:
+                    for line in res.stdout.splitlines():
+                        if ' connected primary ' in line:
+                            return line.split()[0]
+                    for line in res.stdout.splitlines():
+                        if ' connected ' in line:
+                            return line.split()[0]
             except Exception:
                 pass
 
@@ -2834,36 +2876,37 @@ def get_active_window_info():
 
     # ================= LINUX IMPLEMENTATION =================
     if IS_LINUX:
-        # 1. KDE Plasma via KWin D-Bus WindowsRunner + getWindowInfo (100% non-interactive, zero pointer grabbing)
-        try:
-            out = subprocess.check_output(
-                ['busctl', '--user', 'call', 'org.kde.KWin', '/WindowsRunner', 'org.kde.krunner1', 'Match', 's', ''],
-                text=True, timeout=0.8
-            )
-            matches = re.findall(r'\"0_(\{([a-f0-9-]+)\})\"\s+\"([^\"]+)\"', out)
-            if matches:
-                full_uuid, uuid_clean, title_raw = matches[0]
-                import codecs
-                title = codecs.escape_decode(title_raw.encode('latin1'))[0].decode('utf-8', errors='ignore')
-                app = ''
-                pid = 0
-                try:
-                    info_out = subprocess.check_output(
-                        ['busctl', '--user', 'call', 'org.kde.KWin', '/KWin', 'org.kde.KWin', 'getWindowInfo', 's', full_uuid],
-                        text=True, timeout=0.8
-                    )
-                    m_pid = re.search(r'\"pid\"\s+i\s+(\d+)', info_out)
-                    if m_pid:
-                        pid = int(m_pid.group(1))
-                    m_df = re.search(r'\"desktopFile\"\s+s\s+\"([^\"]*)\"', info_out)
-                    desktop_file = m_df.group(1).strip() if m_df else ''
-                    m_rc = re.search(r'\"resourceClass\"\s+s\s+\"([^\"]*)\"', info_out)
-                    res_class = m_rc.group(1).strip() if m_rc else ''
-                    m_cap = re.search(r'\"caption\"\s+s\s+\"([^\"]*)\"', info_out)
-                    if m_cap and m_cap.group(1).strip():
-                        title = codecs.escape_decode(m_cap.group(1).encode('latin1'))[0].decode('utf-8', errors='ignore')
-                except Exception:
-                    desktop_file, res_class = '', ''
+        # 1. KDE Plasma via KWin D-Bus WindowsRunner + getWindowInfo (only if KWin is running)
+        if is_kwin_available():
+            try:
+                out = subprocess.check_output(
+                    ['busctl', '--user', 'call', 'org.kde.KWin', '/WindowsRunner', 'org.kde.krunner1', 'Match', 's', ''],
+                    text=True, timeout=0.8, stderr=subprocess.DEVNULL
+                )
+                matches = re.findall(r'\"0_(\{([a-f0-9-]+)\})\"\s+\"([^\"]+)\"', out)
+                if matches:
+                    full_uuid, uuid_clean, title_raw = matches[0]
+                    import codecs
+                    title = codecs.escape_decode(title_raw.encode('latin1'))[0].decode('utf-8', errors='ignore')
+                    app = ''
+                    pid = 0
+                    try:
+                        info_out = subprocess.check_output(
+                            ['busctl', '--user', 'call', 'org.kde.KWin', '/KWin', 'org.kde.KWin', 'getWindowInfo', 's', full_uuid],
+                            text=True, timeout=0.8, stderr=subprocess.DEVNULL
+                        )
+                        m_pid = re.search(r'\"pid\"\s+i\s+(\d+)', info_out)
+                        if m_pid:
+                            pid = int(m_pid.group(1))
+                        m_df = re.search(r'\"desktopFile\"\s+s\s+\"([^\"]*)\"', info_out)
+                        desktop_file = m_df.group(1).strip() if m_df else ''
+                        m_rc = re.search(r'\"resourceClass\"\s+s\s+\"([^\"]*)\"', info_out)
+                        res_class = m_rc.group(1).strip() if m_rc else ''
+                        m_cap = re.search(r'\"caption\"\s+s\s+\"([^\"]*)\"', info_out)
+                        if m_cap and m_cap.group(1).strip():
+                            title = codecs.escape_decode(m_cap.group(1).encode('latin1'))[0].decode('utf-8', errors='ignore')
+                    except Exception:
+                        desktop_file, res_class = '', ''
 
                 if pid > 0:
                     try:
@@ -2895,8 +2938,8 @@ def get_active_window_info():
                     app = app.capitalize()
 
                 return {"title": title, "process": app, "pid": pid}
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # 2. Hyprland: hyprctl
         if shutil.which('hyprctl'):
@@ -3702,6 +3745,8 @@ def main():
         server_address = ('0.0.0.0', port)
         httpd = ThreadingHTTPServer(server_address, MonitorRequestHandler)
 
+    httpd.daemon_threads = True
+
     url = f"http://{local_ip}:{port}"
 
     os_label = "LINUX" if IS_LINUX else ("WINDOWS" if IS_WINDOWS else sys.platform.upper())
@@ -3731,7 +3776,13 @@ def main():
     except KeyboardInterrupt:
         print("\n[!] Server dimatikan.")
         collector.running = False
-        httpd.server_close()
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        if IS_WINDOWS and kernel32:
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), 0)
+        os._exit(0)
 
 
 if __name__ == '__main__':
